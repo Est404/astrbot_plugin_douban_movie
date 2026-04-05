@@ -156,6 +156,15 @@ class ProfileGenerator:
         if not movies:
             return "暂无观影数据，请先使用 /movie sync 同步片单。"
 
+        # 数据完整性校验
+        with_genres = sum(1 for m in movies if m.get("genres"))
+        genre_ratio = with_genres / len(movies) if movies else 0
+        if genre_ratio < 0.3:
+            return (
+                f"⚠️ 画像数据不充分：{len(movies)} 部影片中仅 {with_genres} 部有类型信息。\n"
+                "请再次执行 /movie sync 补充影片详情后重试。"
+            )
+
         stats = self._collect_stats(movies)
 
         # 尝试 LLM 辅助

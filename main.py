@@ -149,46 +149,65 @@ class DoubanMovie(Star):
 
             douban_uid = bind_info["douban_uid"]
             last_sync = bind_info.get("last_sync")
+            sync_timeout = float(self.config.get("sync_timeout", 60))
 
-            sync_timeout = self.config.get("sync_timeout", 60)
+            # 逐页抓取 + 即时写入，超时也能保留已获取的数据
+            counts = {"wish": 0, "do": 0, "collect": 0}
+            timed_out = False
 
-            # 带超时的同步
             try:
-                results = await asyncio.wait_for(
-                    self.client.fetch_all_collections(douban_uid, last_sync),
-                    timeout=float(sync_timeout),
-                )
+                async with asyncio.timeout(sync_timeout):
+                    for status_type in ("wish", "do", "collect"):
+                        start = 0
+                        while True:
+                            await self.client._delay()
+                            movies, has_more = (
+                                await self.client.fetch_collection_page(
+                                    douban_uid, status_type, start
+                                )
+                            )
+                            if not movies:
+                                break
+
+                            # 增量过滤：跳过上次同步之前标记的
+                            if last_sync:
+                                new_movies = []
+                                for m in movies:
+                                    if m.get("marked_at") and m["marked_at"] > last_sync:
+                                        new_movies.append(m)
+                                    else:
+                                        has_more = False
+                                        break
+                                movies = new_movies
+
+                            # 即时写入
+                            for movie in movies:
+                                await self.db.upsert_movie(uid, movie)
+                            await self.db.commit_batch()
+                            counts[status_type] += len(movies)
+
+                            if not has_more:
+                                break
+                            start += 15
             except asyncio.TimeoutError:
-                await self.db.update_last_sync(uid)
-                yield event.plain_result(
-                    f"⚠️ 同步超时（{sync_timeout}s），已保存已获取的数据。"
-                    "可再次执行同步继续。"
-                )
-                return
+                timed_out = True
+                logger.warning(f"用户 {uid} 同步超时，已保存部分数据")
 
-            # 写入数据库
-            total_new = 0
-            for status_type, movies in results.items():
-                for movie in movies:
-                    await self.db.upsert_movie(uid, movie)
-                    total_new += 1
-
-            await self.db.commit_batch()
+            total_new = sum(counts.values())
 
             # 补充详情（genres / regions / year）
+            enrich_limit = self.config.get("detail_enrich_limit", 50)
             if total_new > 0:
-                enrich_limit = self.config.get("detail_enrich_limit", 20)
-                await self._enrich_movie_details(uid, min(total_new, enrich_limit))
+                await self._enrich_movie_details(uid, enrich_limit)
 
             await self.db.update_last_sync(uid)
 
-            wish = len(results["wish"])
-            do = len(results["do"])
-            collect = len(results["collect"])
-            yield event.plain_result(
-                f"✅ 同步完成！已同步 {total_new} 部影片\n"
-                f"想看 {wish} · 在看 {do} · 看过 {collect}"
-            )
+            wish, do, collect = counts["wish"], counts["do"], counts["collect"]
+            msg = f"✅ 同步完成！已同步 {total_new} 部影片\n"
+            msg += f"想看 {wish} · 在看 {do} · 看过 {collect}"
+            if timed_out:
+                msg += f"\n\n⚠️ 部分片单因超时未完成，可再次执行同步继续。"
+            yield event.plain_result(msg)
             logger.info(f"用户 {uid} 同步了 {total_new} 部影片")
         except Exception as exc:
             logger.error(f"同步失败: {exc}")

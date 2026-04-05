@@ -347,9 +347,12 @@ class DoubanClient:
                 if len(lines) >= 2:
                     parts = [s.strip() for s in lines[-1].split("/")]
                     if len(parts) >= 2:
-                        regions = parts[1].strip()
+                        # 地区可能在中间多个部分（如 "美国 / 英国"）
+                        region_parts = parts[1:-1]
+                        regions = ",".join(r.strip() for r in region_parts if r.strip())
                     if len(parts) >= 3:
-                        genres = re.sub(r"\s+", ",", parts[2].strip())
+                        # genres 始终在最后一个部分
+                        genres = re.sub(r"\s+", ",", parts[-1].strip())
 
         return {
             "douban_movie_id": movie_id,

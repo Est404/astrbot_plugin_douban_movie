@@ -27,6 +27,35 @@ class Recommender:
             self._top250_cache = await self.client.fetch_top250()
         return self._top250_cache
 
+    @staticmethod
+    def _diversify(candidates: list[dict], count: int) -> list[dict]:
+        """从候选列表中选出得分最高且类型不重复的推荐。"""
+        if len(candidates) <= count:
+            return candidates
+
+        selected: list[dict] = []
+        seen_genres: set[str] = set()
+
+        # 第一轮：优先选不同类型的
+        for c in candidates:
+            if len(selected) >= count:
+                break
+            movie_genres = {g.strip() for g in c.get("genres", "").split(",") if g.strip()}
+            if not movie_genres or not (movie_genres & seen_genres):
+                selected.append(c)
+                seen_genres.update(movie_genres)
+
+        # 第二轮：如果还不够，按分数补齐
+        if len(selected) < count:
+            selected_ids = {c["douban_movie_id"] for c in selected}
+            for c in candidates:
+                if len(selected) >= count:
+                    break
+                if c["douban_movie_id"] not in selected_ids:
+                    selected.append(c)
+
+        return selected
+
     def _build_llm_prompt(self, user_prefs: dict, results: list[dict]) -> str:
         """构造 LLM prompt 用于生成推荐理由。"""
         genre_lines = [f"- {g}：{c}部" for g, c in user_prefs["top_genres"]]
@@ -141,7 +170,8 @@ class Recommender:
             candidates.append({**movie, "score": score, "matched_genres": matched})
 
         candidates.sort(key=lambda x: x["score"], reverse=True)
-        results = candidates[: self._recommend_count]
+        # 多样性打散：避免连续推荐相同类型的影片
+        results = self._diversify(candidates, self._recommend_count)
 
         if not results:
             return results

@@ -117,7 +117,7 @@ class TestRatingTypes:
 
     def test_lenient_rating(self):
         """avg >= 4.0 -> lenient."""
-        movies = [make_movie(user_rating=5.0) for _ in range(3)]
+        movies = [make_movie(genres="剧情", user_rating=5.0) for _ in range(3)]
         db = make_db(movies)
         gen = ProfileGenerator(db)
         text = run(gen.generate("u"))
@@ -125,7 +125,7 @@ class TestRatingTypes:
 
     def test_strict_rating(self):
         """avg <= 2.5 -> strict."""
-        movies = [make_movie(user_rating=1.0) for _ in range(3)]
+        movies = [make_movie(genres="剧情", user_rating=1.0) for _ in range(3)]
         db = make_db(movies)
         gen = ProfileGenerator(db)
         text = run(gen.generate("u"))
@@ -133,7 +133,7 @@ class TestRatingTypes:
 
     def test_neutral_rating(self):
         """2.5 < avg < 4.0 -> neutral."""
-        movies = [make_movie(user_rating=3.0) for _ in range(3)]
+        movies = [make_movie(genres="剧情", user_rating=3.0) for _ in range(3)]
         db = make_db(movies)
         gen = ProfileGenerator(db)
         text = run(gen.generate("u"))
@@ -141,7 +141,7 @@ class TestRatingTypes:
 
     def test_exactly_4_0_is_lenient(self):
         """avg == 4.0 -> lenient (>= 4.0)."""
-        movies = [make_movie(user_rating=4.0) for _ in range(3)]
+        movies = [make_movie(genres="剧情", user_rating=4.0) for _ in range(3)]
         db = make_db(movies)
         gen = ProfileGenerator(db)
         text = run(gen.generate("u"))
@@ -149,7 +149,7 @@ class TestRatingTypes:
 
     def test_exactly_2_5_is_strict(self):
         """avg == 2.5 -> strict (<= 2.5)."""
-        movies = [make_movie(user_rating=2.5) for _ in range(3)]
+        movies = [make_movie(genres="剧情", user_rating=2.5) for _ in range(3)]
         db = make_db(movies)
         gen = ProfileGenerator(db)
         text = run(gen.generate("u"))
@@ -178,12 +178,13 @@ class TestProfileEdgeCases:
         assert "暂无观影数据" in text
 
     def test_movies_without_genres(self):
-        """Movies with empty genres -> no crash."""
+        """Movies with empty genres -> data completeness check triggers."""
         movies = [make_movie(title="NG", genres="", regions="美国", year=2020, user_rating=4.0)]
         db = make_db(movies)
         gen = ProfileGenerator(db)
         text = run(gen.generate("u"))
-        assert "观影画像" in text
+        # 完整性校验应返回提示信息
+        assert "数据不充分" in text or "同步" in text
 
     def test_movies_without_regions(self):
         """Movies with empty regions -> no crash."""

@@ -159,9 +159,9 @@ class TestConfSchemaSemanticConstraints:
     def test_detail_enrich_limit_positive(self, schema):
         assert schema["detail_enrich_limit"]["default"] > 0
 
-    def test_detail_enrich_limit_default_is_20(self, schema):
-        """After refactor, detail_enrich_limit default changed from 50 to 20."""
-        assert schema["detail_enrich_limit"]["default"] == 20
+    def test_detail_enrich_limit_default_is_50(self, schema):
+        """detail_enrich_limit default is 50 (raised from 20 for better first-sync coverage)."""
+        assert schema["detail_enrich_limit"]["default"] == 50
 
 
 class TestConfSchemaProviderFields:

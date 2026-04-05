@@ -39,7 +39,7 @@
     "description": "单次同步后补充影片详情的最大数量",
     "type": "int",
     "hint": "同步后会为缺少类型/地区信息的影片抓取详情，此值控制每次补充的上限",
-    "default": 20
+    "default": 50
   },
   "profile_provider_id": {
     "description": "生成用户画像使用的LLM模型",
