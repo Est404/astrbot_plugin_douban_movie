@@ -85,7 +85,6 @@ def test_import_service_douban_client():
     assert hasattr(DoubanClient, "search_movies")
     assert hasattr(DoubanClient, "validate_douban_uid")
     assert hasattr(DoubanClient, "_request_json")
-    assert hasattr(DoubanClient, "_request_html")
 
 
 def test_import_service_profile():

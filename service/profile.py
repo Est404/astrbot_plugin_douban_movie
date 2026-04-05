@@ -15,103 +15,226 @@ class ProfileGenerator:
         self.db = db
         self.client = client
 
+    # ── 数据提取 ──────────────────────────────────────────────
+
     def _extract_prefs_from_stats(self, stats: dict) -> dict:
-        """从 collection_stats API 响应中提取偏好数据。"""
-        # 类型偏好 — 从 recent_subjects 的 genres 统计
-        genre_counts: dict[str, int] = {}
-        region_counts: dict[str, int] = {}
-        decade_counts: dict[str, int] = {}
+        """从 collection_stats API 完整响应中提取画像数据。
 
-        for subj in stats.get("recent_subjects", []):
-            # genres
-            for g in subj.get("genres", []):
-                name = g.get("name", "") if isinstance(g, dict) else str(g)
-                if name:
-                    genre_counts[name] = genre_counts.get(name, 0) + 1
+        直接使用 API 返回的顶层统计字段（genres, countries, years, directors, actors），
+        不再依赖 recent_subjects 的小样本统计。
+        """
+        total = stats.get("total_collections", 0)
 
-            # 从 card_subtitle 提取地区和年代
-            card = subj.get("card_subtitle", "")
-            parts = [p.strip() for p in card.split(" / ")]
+        # 类型偏好 — API 直接返回 genres 数组 [{name, value}]
+        genre_raw = stats.get("genres", [])
+        genre_prefs = []
+        for g in genre_raw[:6]:
+            name = g.get("name", "")
+            value = g.get("value", 0)
+            percent = round(value / total * 100) if total > 0 else 0
+            genre_prefs.append({"name": name, "value": value, "percent": percent})
 
-            year = subj.get("year")
-            if year:
-                decade = f"{(int(year) // 10) * 10}s"
-                decade_counts[decade] = decade_counts.get(decade, 0) + 1
+        # 地区偏好 — API 直接返回 countries 数组
+        country_raw = stats.get("countries", [])
+        country_prefs = []
+        for c in country_raw[:5]:
+            name = c.get("name", "")
+            value = c.get("value", 0)
+            percent = round(value / total * 100) if total > 0 else 0
+            country_prefs.append({"name": name, "value": value, "percent": percent})
 
-            # 地区（card_subtitle 中通常是 第二部分）
-            if len(parts) >= 2:
-                region = parts[1].strip()
-                if region:
-                    region_counts[region] = region_counts.get(region, 0) + 1
+        # 年代偏好 — API 直接返回 years 数组
+        decade_prefs = []
+        for y in stats.get("years", []):
+            name = y.get("name", "")
+            value = y.get("value", 0)
+            percent = round(value / total * 100) if total > 0 else 0
+            decade_prefs.append({"name": name, "value": value, "percent": percent})
 
-        # 排序取 Top
-        top_genres = sorted(genre_counts.items(), key=lambda x: x[1], reverse=True)[:5]
-        top_regions = sorted(region_counts.items(), key=lambda x: x[1], reverse=True)[:3]
-        top_decades = sorted(decade_counts.items(), key=lambda x: x[1], reverse=True)
+        # 年度标记分布
+        collect_years = [
+            {"name": y.get("name", ""), "value": y.get("value", 0)}
+            for y in stats.get("collect_years", [])
+        ]
 
-        # 总标记数
-        total_marked = 0
-        for year_data in stats.get("years", []):
-            total_marked += year_data.get("value", 0)
+        # 最爱导演
+        top_directors = []
+        for d in stats.get("directors", [])[:3]:
+            known_for = []
+            for m in d.get("known_for", [])[:2]:
+                known_for.append(m.get("title", ""))
+            top_directors.append({
+                "name": d.get("name", ""),
+                "known_for": known_for,
+            })
+
+        # 最爱演员
+        top_actors = []
+        for a in stats.get("actors", [])[:3]:
+            known_for = []
+            for m in a.get("known_for", [])[:2]:
+                known_for.append(m.get("title", ""))
+            top_actors.append({
+                "name": a.get("name", ""),
+                "known_for": known_for,
+            })
+
+        # 最近在看
+        recent_watched = []
+        for s in stats.get("recent_subjects", [])[:5]:
+            rating_info = s.get("rating", {})
+            rating_val = rating_info.get("value") if isinstance(rating_info, dict) else None
+            recent_watched.append({
+                "title": s.get("title", ""),
+                "year": s.get("year", ""),
+                "type": s.get("type", ""),
+                "rating": rating_val,
+            })
 
         return {
-            "total_marked": total_marked,
-            "genre_prefs": top_genres,
-            "region_prefs": top_regions,
-            "decade_prefs": top_decades,
+            "nickname": (stats.get("user") or {}).get("name", ""),
+            "total_marked": total,
+            "total_hours": stats.get("total_spent", 0),
+            "total_cinema": stats.get("total_cenima", 0),
+            "total_comments": stats.get("total_comment", 0),
+            "total_reviews": stats.get("total_review", 0),
+            "weekly_avg": stats.get("weekly_avg", 0),
+            "genre_prefs": genre_prefs,
+            "country_prefs": country_prefs,
+            "decade_prefs": decade_prefs,
+            "collect_years": collect_years,
+            "top_directors": top_directors,
+            "top_actors": top_actors,
+            "recent_watched": recent_watched,
         }
 
-    def _format_profile_from_stats(
-        self,
-        prefs: dict,
-        nickname: str = "",
-    ) -> str:
+    # ── 纯文本画像（回退） ────────────────────────────────────
+
+    def _format_profile_from_stats(self, prefs: dict, nickname: str = "") -> str:
         """将统计数据格式化为纯文本画像（LLM 不可用时的回退）。"""
+        name = nickname or prefs.get("nickname") or "你"
         total = prefs["total_marked"]
-        name = nickname or "你"
+        hours = prefs["total_hours"]
+        cinema = prefs["total_cinema"]
 
         lines = [
             f"🎬 {name} 的观影画像",
             "",
             f"📊 观影量：{total} 部标记",
+            f"⏱ 累计观影：约 {hours:.0f} 小时" + (f" | 🏢 影院打卡 {cinema} 次" if cinema else ""),
         ]
 
         genre_prefs = prefs.get("genre_prefs", [])
         if genre_prefs:
-            genre_parts = [
-                f"{g} ({c})" for g, c in genre_prefs[:5]
-            ]
-            lines.append(f"🎭 类型偏好：{' | '.join(genre_parts)}")
+            parts = [f"{g['name']} ({g['percent']}%)" for g in genre_prefs[:5]]
+            lines.append(f"🎭 类型偏好：{' | '.join(parts)}")
 
-        region_prefs = prefs.get("region_prefs", [])
-        if region_prefs:
-            region_parts = [f"{r} ({c})" for r, c in region_prefs[:3]]
-            lines.append(f"🌍 地区偏好：{' | '.join(region_parts)}")
+        country_prefs = prefs.get("country_prefs", [])
+        if country_prefs:
+            parts = [f"{c['name']} ({c['percent']}%)" for c in country_prefs[:5]]
+            lines.append(f"🌍 地区偏好：{' | '.join(parts)}")
 
         decade_prefs = prefs.get("decade_prefs", [])
         if decade_prefs:
-            decade_parts = [f"{d} ({c})" for d, c in decade_prefs]
-            lines.append(f"📅 年代偏好：{' | '.join(decade_parts)}")
+            parts = [f"{d['name']} ({d['percent']}%)" for d in decade_prefs]
+            lines.append(f"📅 年代偏好：{' | '.join(parts)}")
+
+        top_directors = prefs.get("top_directors", [])
+        if top_directors:
+            names = [d["name"] for d in top_directors]
+            lines.append(f"🎯 最爱导演：{'、'.join(names)}")
+
+        top_actors = prefs.get("top_actors", [])
+        if top_actors:
+            names = [a["name"] for a in top_actors]
+            lines.append(f"🌟 最爱演员：{'、'.join(names)}")
+
+        recent = prefs.get("recent_watched", [])
+        if recent:
+            parts = []
+            for r in recent:
+                rating_str = f" ⭐{r['rating']}" if r.get("rating") else ""
+                parts.append(f"{r['title']} ({r['year']}){rating_str}")
+            lines.append(f"📌 最近在看：{' | '.join(parts)}")
 
         return "\n".join(lines)
 
+    # ── LLM prompt ────────────────────────────────────────────
+
     def _build_llm_prompt(self, prefs: dict, nickname: str = "") -> str:
         """构造 LLM prompt 用于画像生成。"""
-        name = nickname or "该用户"
+        name = nickname or prefs.get("nickname") or "该用户"
 
-        genre_lines = [f"- {g}：{c}部" for g, c in prefs.get("genre_prefs", [])]
-        region_lines = [f"- {r}：{c}部" for r, c in prefs.get("region_prefs", [])]
-        decade_lines = [f"- {d}：{c}部" for d, c in prefs.get("decade_prefs", [])]
+        # 序列化画像数据
+        data_lines = [
+            f"用户共标记 {prefs['total_marked']} 部影视，"
+            f"累计观影约 {prefs['total_hours']:.0f} 小时"
+            + (f"，影院打卡 {prefs['total_cinema']} 次" if prefs["total_cinema"] else "")
+            + "。",
+        ]
+
+        genre_prefs = prefs.get("genre_prefs", [])
+        if genre_prefs:
+            parts = [f"{g['name']} ({g['percent']}%)" for g in genre_prefs[:5]]
+            data_lines.append(f"类型偏好：{' | '.join(parts)}")
+
+        country_prefs = prefs.get("country_prefs", [])
+        if country_prefs:
+            parts = [f"{c['name']} ({c['percent']}%)" for c in country_prefs[:5]]
+            data_lines.append(f"地区偏好：{' | '.join(parts)}")
+
+        decade_prefs = prefs.get("decade_prefs", [])
+        if decade_prefs:
+            parts = [f"{d['name']} ({d['percent']}%)" for d in decade_prefs]
+            data_lines.append(f"年代偏好：{' | '.join(parts)}")
+
+        top_directors = prefs.get("top_directors", [])
+        if top_directors:
+            director_strs = []
+            for d in top_directors:
+                known = "、".join(d.get("known_for", [])[:2])
+                director_strs.append(f"{d['name']}（代表作：{known}）" if known else d["name"])
+            data_lines.append(f"最爱导演：{' | '.join(director_strs)}")
+
+        top_actors = prefs.get("top_actors", [])
+        if top_actors:
+            actor_strs = []
+            for a in top_actors:
+                known = "、".join(a.get("known_for", [])[:2])
+                actor_strs.append(f"{a['name']}（代表作：{known}）" if known else a["name"])
+            data_lines.append(f"最爱演员：{' | '.join(actor_strs)}")
+
+        recent = prefs.get("recent_watched", [])
+        if recent:
+            parts = []
+            for r in recent:
+                rating_str = f" ⭐{r['rating']}" if r.get("rating") else ""
+                parts.append(f"{r['title']} ({r['year']}){rating_str}")
+            data_lines.append(f"最近在看：{' | '.join(parts)}")
+
+        # 找观影高峰年
+        collect_years = prefs.get("collect_years", [])
+        peak_year = ""
+        if collect_years:
+            peak = max(collect_years, key=lambda x: x.get("value", 0))
+            if peak.get("value", 0) > 0:
+                peak_year = f"\n额外洞察：{peak['name']}年是观影高峰期，看片量是一年{peak['value']}部。"
+
+        data_text = "\n".join(data_lines)
 
         return (
-            f"请根据以下豆瓣用户「{name}」的观影统计数据，"
-            "生成一段生动有趣的中文观影画像分析（200字以内）。\n\n"
-            f"用户共标记 {prefs['total_marked']} 部影视。\n\n"
-            "类型偏好：\n" + "\n".join(genre_lines) + "\n\n"
-            "地区偏好：\n" + "\n".join(region_lines) + "\n\n"
-            "年代偏好：\n" + "\n".join(decade_lines) + "\n\n"
+            f"你是一位观影分析师，正在为用户「{name}」生成观影画像。\n"
+            "请根据以下数据，用简洁生动的语言生成一份观影画像报告。\n\n"
+            "要求：\n"
+            "- 使用第二人称\"你\"来称呼用户\n"
+            "- 不要简单罗列数据，要有洞察和总结\n"
+            "- 最后用一句话概括这位用户的观影品味\n\n"
+            f"用户数据：\n{data_text}\n"
+            f"{peak_year}\n\n"
             "请直接输出画像分析文本，不要加标题或额外格式。"
         )
+
+    # ── 主生成方法 ────────────────────────────────────────────
 
     async def generate(
         self,
@@ -120,21 +243,10 @@ class ProfileGenerator:
         context=None,
         provider_id: str = "",
     ) -> str:
-        """生成用户观影画像。
-
-        Args:
-            astrbot_uid: AstrBot 用户 ID
-            persona_text: 人格提示词（注入到 LLM system prompt）
-            context: AstrBot Context（用于调用 llm_generate）
-            provider_id: LLM provider ID
-
-        Returns:
-            格式化的画像文本
-        """
+        """生成用户观影画像。"""
         # 检查缓存
         cached = await self.db.get_profile(astrbot_uid)
         if cached and cached.get("profile_text"):
-            # 检查是否新鲜（24h 内）
             from datetime import datetime, timedelta, timezone
             updated_str = cached.get("updated_at")
             if updated_str:
@@ -161,13 +273,13 @@ class ProfileGenerator:
                 return "❌ 豆瓣 Cookie 已失效，请联系管理员更新。"
             return "❌ 获取观影数据失败，请稍后重试。"
 
-        # 提取偏好
+        # 提取偏好（使用完整 API 数据）
         prefs = self._extract_prefs_from_stats(stats)
 
-        # 保存偏好数据到 DB（不管 LLM 是否成功都保存）
-        genre_list = [g for g, _ in prefs["genre_prefs"]]
-        region_list = [r for r, _ in prefs["region_prefs"]]
-        decade_list = [d for d, _ in prefs["decade_prefs"]]
+        # 保存偏好数据到 DB
+        genre_list = [g["name"] for g in prefs["genre_prefs"]]
+        region_list = [c["name"] for c in prefs["country_prefs"]]
+        decade_list = [d["name"] for d in prefs["decade_prefs"]]
 
         # 尝试 LLM 辅助
         profile_text = None
@@ -182,7 +294,6 @@ class ProfileGenerator:
                     system_prompt=system_prompt,
                 )
                 if llm_resp and llm_resp.completion_text:
-                    # LLM 分析 + 统计数据
                     formatted = self._format_profile_from_stats(prefs, nickname)
                     profile_text = f"{llm_resp.completion_text}\n\n{formatted}"
             except Exception as exc:

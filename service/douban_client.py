@@ -5,7 +5,6 @@ from typing import Optional
 from urllib.parse import quote_plus
 
 import httpx
-from bs4 import BeautifulSoup
 from astrbot.api import logger
 
 _MOBILE_UA = (
@@ -18,12 +17,6 @@ _REXXAR_HEADERS = {
     "User-Agent": _MOBILE_UA,
     "Referer": "https://m.douban.com/",
     "Accept": "application/json",
-}
-
-_SEARCH_HEADERS = {
-    "User-Agent": _MOBILE_UA,
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
 }
 
 
@@ -99,43 +92,6 @@ class DoubanClient:
 
         return None
 
-    async def _request_html(
-        self, url: str, headers: dict | None = None
-    ) -> Optional[str]:
-        """GET 请求返回 HTML 文本。"""
-        retries = self._max_retries
-
-        for attempt in range(retries):
-            try:
-                req_headers = {**(headers or _SEARCH_HEADERS)}
-                if self._cookie:
-                    req_headers["Cookie"] = self._cookie
-
-                async with httpx.AsyncClient(
-                    headers=req_headers, follow_redirects=True, timeout=15.0
-                ) as client:
-                    resp = await client.get(url)
-
-                    if resp.status_code in (403, 429):
-                        wait = random.uniform(2, 5) * (attempt + 1)
-                        logger.warning(
-                            f"豆瓣反爬 {resp.status_code}，{wait:.1f}s 后重试 "
-                            f"({attempt + 1}/{retries})"
-                        )
-                        await asyncio.sleep(wait)
-                        continue
-
-                    if resp.status_code == 200:
-                        return resp.text
-
-                    logger.warning(f"请求 {url} 返回 {resp.status_code}")
-                    return None
-            except httpx.RequestError as exc:
-                logger.warning(f"请求 {url} 异常: {exc}")
-                if attempt < retries - 1:
-                    await asyncio.sleep(random.uniform(1, 3))
-
-        return None
 
     async def _delay(self):
         await asyncio.sleep(random.uniform(self._interval_min, self._interval_max))
@@ -174,12 +130,9 @@ class DoubanClient:
         if not stats:
             return None
 
-        viewer = stats.get("viewer") or {}
-        nickname = viewer.get("name", "")
-
-        total_marked = 0
-        for year_data in stats.get("years", []):
-            total_marked += year_data.get("value", 0)
+        user_info = stats.get("user") or {}
+        nickname = user_info.get("name", "")
+        total_marked = stats.get("total_collections", 0)
 
         return {
             "uid": douban_uid,
@@ -199,103 +152,51 @@ class DoubanClient:
         )
         return await self._request_json(url)
 
-    # ── 电影搜索 ──────────────────────────────────────────
+    # ── 电影搜索（Rexxar API） ────────────────────────────
 
     async def search_movies(
         self, keyword: str, max_results: int = 40
     ) -> list[dict]:
         """搜索豆瓣电影，返回 [{id, title, rating, year, card_subtitle}]。
 
-        使用移动端搜索页面，解析 HTML。
+        使用 Rexxar 搜索 API，返回纯 JSON。
         """
         encoded_kw = quote_plus(keyword)
-        url = f"https://m.douban.com/search/?query={encoded_kw}&type=movie"
+        url = (
+            f"https://m.douban.com/rexxar/api/v2/search?"
+            f"q={encoded_kw}&count={max_results}&type=movie"
+        )
 
         await self._delay()
-        html = await self._request_html(url)
-        if not html:
+        data = await self._request_json(url)
+        if not data:
             return []
 
-        return self._parse_search_results(html, max_results)
-
-    @staticmethod
-    def _parse_search_results(html: str, max_results: int = 40) -> list[dict]:
-        """解析移动端搜索结果 HTML。"""
-        soup = BeautifulSoup(html, "html.parser")
         results = []
+        for item in data.get("items", []):
+            target = item.get("target", {})
+            target_type = item.get("target_type", "")
 
-        # 移动端搜索结果通常在 .search-results 或 .result-list 中
-        items = soup.select(".search-results .result-item") or \
-                soup.select(".result-list .result") or \
-                soup.select(".subject-catalog .subject") or \
-                soup.select(".search-result")
+            # 只保留电影条目，过滤片单/排行榜等
+            if target_type != "movie":
+                continue
 
-        if not items:
-            # 尝试更宽泛的选择器
-            items = soup.select("[data-id]")
+            movie_id = target.get("id")
+            if not movie_id:
+                continue
 
-        for item in items[:max_results]:
-            try:
-                movie = DoubanClient._parse_search_item(item)
-                if movie:
-                    results.append(movie)
-            except Exception as exc:
-                logger.debug(f"解析搜索条目失败: {exc}")
+            rating_info = target.get("rating", {})
+            rating_val = rating_info.get("value") if isinstance(rating_info, dict) else None
+
+            results.append({
+                "id": str(movie_id),
+                "title": target.get("title", ""),
+                "rating": rating_val,
+                "year": target.get("year"),
+                "card_subtitle": target.get("card_subtitle", ""),
+            })
 
         return results
-
-    @staticmethod
-    def _parse_search_item(item) -> Optional[dict]:
-        """解析单个搜索结果条目。"""
-        # 提取电影 ID
-        movie_id = None
-
-        # data-id 属性
-        movie_id = item.get("data-id", "")
-        if not movie_id:
-            # 从链接提取
-            link = item.select_one("a[href*='/subject/']")
-            if link:
-                href = link.get("href", "")
-                m = re.search(r"/subject/(\d+)", href)
-                if m:
-                    movie_id = m.group(1)
-
-        if not movie_id:
-            return None
-
-        # 标题
-        title = ""
-        title_elem = item.select_one(".title") or item.select_one("h3") or item.select_one("a")
-        if title_elem:
-            title = title_elem.get_text(strip=True)
-
-        # 评分
-        rating = None
-        rating_elem = item.select_one(".rating_nums") or item.select_one("[class*='rating']")
-        if rating_elem:
-            try:
-                rating = float(rating_elem.get_text(strip=True))
-            except (ValueError, TypeError):
-                pass
-
-        # 年份 / 信息行
-        year = None
-        card_subtitle = ""
-        info_elem = item.select_one(".subject-cast") or item.select_one(".meta") or item.select_one(".info")
-        if info_elem:
-            card_subtitle = info_elem.get_text(strip=True)
-            ym = re.search(r"(\d{4})", card_subtitle)
-            if ym:
-                year = int(ym.group(1))
-
-        return {
-            "id": str(movie_id),
-            "title": title,
-            "rating": rating,
-            "year": year,
-            "card_subtitle": card_subtitle,
-        }
 
     # ── 电影详情（Rexxar API） ────────────────────────────
 
