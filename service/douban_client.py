@@ -32,16 +32,28 @@ _BASE_HEADERS = {
 class DoubanClient:
     """豆瓣页面抓取与解析客户端。"""
 
+    def __init__(
+        self,
+        interval_min: float = 1.0,
+        interval_max: float = 3.0,
+        max_retries: int = 3,
+    ):
+        self._interval_min = interval_min
+        self._interval_max = interval_max
+        self._max_retries = max_retries
+
     # ── 基础请求 ────────────────────────────────────────────
 
     async def _request(
-        self, url: str, cookie: str = "", max_retries: int = 3
+        self, url: str, cookie: str = "", max_retries: int | None = None
     ) -> Optional[str]:
         headers = {**_BASE_HEADERS}
         if cookie:
             headers["Cookie"] = cookie
 
-        for attempt in range(max_retries):
+        retries = max_retries if max_retries is not None else self._max_retries
+
+        for attempt in range(retries):
             try:
                 async with httpx.AsyncClient(
                     headers=headers, follow_redirects=True, timeout=15.0
@@ -52,7 +64,7 @@ class DoubanClient:
                         wait = random.uniform(2, 5) * (attempt + 1)
                         logger.warning(
                             f"豆瓣反爬 {resp.status_code}，{wait:.1f}s 后重试 "
-                            f"({attempt + 1}/{max_retries})"
+                            f"({attempt + 1}/{retries})"
                         )
                         await asyncio.sleep(wait)
                         continue
@@ -64,13 +76,13 @@ class DoubanClient:
                     return None
             except httpx.RequestError as exc:
                 logger.warning(f"请求 {url} 异常: {exc}")
-                if attempt < max_retries - 1:
+                if attempt < retries - 1:
                     await asyncio.sleep(random.uniform(1, 3))
 
         return None
 
     async def _delay(self):
-        await asyncio.sleep(random.uniform(1, 3))
+        await asyncio.sleep(random.uniform(self._interval_min, self._interval_max))
 
     # ── Cookie 验证 ─────────────────────────────────────────
 

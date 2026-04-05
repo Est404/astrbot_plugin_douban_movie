@@ -1,0 +1,44 @@
+{
+  "sync_timeout": {
+    "description": "片单同步超时时间（秒）",
+    "type": "int",
+    "hint": "首次全量同步大量影片时可能需要较长时间，建议不低于 30",
+    "default": 60
+  },
+  "recommend_count": {
+    "description": "每次推荐返回的影片数量",
+    "type": "int",
+    "hint": "范围 1~10",
+    "default": 5
+  },
+  "min_rating": {
+    "description": "推荐影片的最低豆瓣评分",
+    "type": "float",
+    "hint": "低于此评分的影片不会被推荐",
+    "default": 8.0
+  },
+  "request_interval_min": {
+    "description": "请求间隔下限（秒）",
+    "type": "float",
+    "hint": "用于反爬，两次请求之间的最小等待时间",
+    "default": 1.0
+  },
+  "request_interval_max": {
+    "description": "请求间隔上限（秒）",
+    "type": "float",
+    "hint": "用于反爬，两次请求之间的最大等待时间",
+    "default": 3.0
+  },
+  "max_retries": {
+    "description": "请求失败后的最大重试次数",
+    "type": "int",
+    "hint": "遇到 403/429 等反爬响应时的重试次数",
+    "default": 3
+  },
+  "detail_enrich_limit": {
+    "description": "单次同步后补充影片详情的最大数量",
+    "type": "int",
+    "hint": "同步后会为缺少类型/地区信息的影片抓取详情，此值控制每次补充的上限",
+    "default": 50
+  }
+}

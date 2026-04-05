@@ -9,9 +9,17 @@ from ..service.douban_client import DoubanClient
 class Recommender:
     """基于用户画像从豆瓣 Top 250 筛选推荐。"""
 
-    def __init__(self, db: Database, client: DoubanClient):
+    def __init__(
+        self,
+        db: Database,
+        client: DoubanClient,
+        recommend_count: int = 5,
+        min_rating: float = 8.0,
+    ):
         self.db = db
         self.client = client
+        self._recommend_count = recommend_count
+        self._min_rating = min_rating
         self._top250_cache: list[dict] | None = None
 
     async def _ensure_top250(self) -> list[dict]:
@@ -59,7 +67,7 @@ class Recommender:
                 continue
 
             # 评分门槛
-            if not movie.get("avg_rating") or movie["avg_rating"] < 8.0:
+            if not movie.get("avg_rating") or movie["avg_rating"] < self._min_rating:
                 continue
 
             # 解析影片类型集合
@@ -86,7 +94,7 @@ class Recommender:
             candidates.append({**movie, "score": score, "matched_genres": matched})
 
         candidates.sort(key=lambda x: x["score"], reverse=True)
-        results = candidates[:5]
+        results = candidates[: self._recommend_count]
 
         # 生成推荐理由
         for r in results:

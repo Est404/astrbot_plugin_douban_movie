@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 
-from astrbot.api import logger
+from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools
 
@@ -13,15 +13,25 @@ from .service.recommender import Recommender
 
 
 class DoubanMovie(Star):
-    def __init__(self, context: Context):
+    def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
 
         data_dir = StarTools.get_data_dir()
 
+        self.config = config
         self.db = Database(str(data_dir / "douban_movie.db"))
-        self.client = DoubanClient()
+        self.client = DoubanClient(
+            interval_min=config.get("request_interval_min", 1.0),
+            interval_max=config.get("request_interval_max", 3.0),
+            max_retries=config.get("max_retries", 3),
+        )
         self.profile_gen = ProfileGenerator(self.db)
-        self.recommender = Recommender(self.db, self.client)
+        self.recommender = Recommender(
+            self.db,
+            self.client,
+            recommend_count=config.get("recommend_count", 5),
+            min_rating=config.get("min_rating", 8.0),
+        )
 
         asyncio.create_task(self._init_db())
         logger.info("豆瓣电影推荐插件已加载")
@@ -139,15 +149,16 @@ class DoubanMovie(Star):
             douban_uid = bind_info["douban_uid"]
 
             # 带超时的同步
+            sync_timeout = self.config.get("sync_timeout", 60)
             try:
                 results = await asyncio.wait_for(
                     self.client.fetch_all_collections(douban_uid, cookie, last_sync),
-                    timeout=60.0,
+                    timeout=float(sync_timeout),
                 )
             except asyncio.TimeoutError:
                 await self.db.update_last_sync(uid)
                 yield event.plain_result(
-                    "⚠️ 同步超时（60s），已保存已获取的数据。可再次执行同步继续。"
+                    f"⚠️ 同步超时（{sync_timeout}s），已保存已获取的数据。可再次执行同步继续。"
                 )
                 return
 
@@ -162,7 +173,8 @@ class DoubanMovie(Star):
 
             # 补充详情（genres / regions / year）
             if total_new > 0:
-                await self._enrich_movie_details(uid, min(total_new, 50))
+                enrich_limit = self.config.get("detail_enrich_limit", 50)
+                await self._enrich_movie_details(uid, min(total_new, enrich_limit))
 
             await self.db.update_last_sync(uid)
 
