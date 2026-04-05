@@ -7,6 +7,8 @@ fragments, including edge cases.
 
 from __future__ import annotations
 
+from unittest.mock import AsyncMock
+
 import pytest
 from bs4 import BeautifulSoup
 
@@ -310,3 +312,79 @@ class TestParseTop250ItemEdgeCases:
             "genres", "regions", "quote",
         }
         assert set(result.keys()) == expected_keys
+
+
+# ===========================================================================
+# validate_uid
+# ===========================================================================
+
+class TestValidateUid:
+
+    async def test_validate_uid_returns_uid_and_nickname(self, mock_client):
+        """validate_uid extracts uid and nickname from profile page."""
+        html = """
+        <html><head><title>测试用户的豆瓣主页</title></head><body></body></html>
+        """
+        mock_client._request = AsyncMock(return_value=html)
+        result = await mock_client.validate_uid("test_user")
+        assert result is not None
+        assert result["uid"] == "test_user"
+        assert result["nickname"] == "测试用户"
+
+    async def test_validate_uid_request_failure(self, mock_client):
+        """validate_uid returns None when request fails."""
+        mock_client._request = AsyncMock(return_value=None)
+        result = await mock_client.validate_uid("bad_user")
+        assert result is None
+
+    async def test_validate_uid_empty_title(self, mock_client):
+        """validate_uid handles page with no title element."""
+        html = "<html><head></head><body></body></html>"
+        mock_client._request = AsyncMock(return_value=html)
+        result = await mock_client.validate_uid("test_user")
+        assert result is not None
+        assert result["uid"] == "test_user"
+        assert result["nickname"] == ""
+
+
+# ===========================================================================
+# fetch_collection_page (no cookie parameter)
+# ===========================================================================
+
+class TestFetchCollectionPage:
+
+    async def test_returns_empty_on_failure(self, mock_client):
+        """fetch_collection_page returns ([], False) when request fails."""
+        mock_client._request = AsyncMock(return_value=None)
+        movies, has_more = await mock_client.fetch_collection_page("uid123", "collect")
+        assert movies == []
+        assert has_more is False
+
+    async def test_no_cookie_param(self, mock_client):
+        """fetch_collection_page should be callable without cookie."""
+        import inspect
+        sig = inspect.signature(mock_client.fetch_collection_page)
+        params = list(sig.parameters.keys())
+        assert "cookie" not in params
+
+
+# ===========================================================================
+# fetch_all_collections (no cookie parameter)
+# ===========================================================================
+
+class TestFetchAllCollections:
+
+    async def test_returns_three_status_keys(self, mock_client):
+        """fetch_all_collections returns dict with wish, do, collect keys."""
+        mock_client.fetch_collection_page = AsyncMock(return_value=([], False))
+        result = await mock_client.fetch_all_collections("uid123")
+        assert "wish" in result
+        assert "do" in result
+        assert "collect" in result
+
+    async def test_no_cookie_param(self, mock_client):
+        """fetch_all_collections should be callable without cookie."""
+        import inspect
+        sig = inspect.signature(mock_client.fetch_all_collections)
+        params = list(sig.parameters.keys())
+        assert "cookie" not in params

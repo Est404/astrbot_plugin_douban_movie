@@ -49,32 +49,31 @@ class DoubanMovie(Star):
     # ── bind ───────────────────────────────────────────────
 
     @movie.command("bind")
-    async def bind(self, event: AstrMessageEvent, cookie: str = ""):
-        """绑定豆瓣账号"""
+    async def bind(self, event: AstrMessageEvent, douban_id: str = ""):
+        """绑定豆瓣主页ID"""
         uid = event.get_sender_id()
 
-        if not cookie:
+        if not douban_id:
             yield event.plain_result(
-                "使用方法：/movie bind <豆瓣Cookie>\n\n"
-                "获取方式：\n"
-                "1. 浏览器登录豆瓣 (douban.com)\n"
-                "2. 按 F12 打开开发者工具 → Network\n"
-                "3. 刷新页面，点击第一个请求\n"
-                "4. 复制 Request Headers 中的 Cookie 值\n\n"
-                "⚠️ 建议在私聊中使用以保护隐私"
+                "使用方法：/movie bind <豆瓣主页ID>\n\n"
+                "示例：/movie bind E-st2000\n\n"
+                "主页ID 是你豆瓣个人主页 URL 中 /people/ 后面的部分。\n"
+                "例如 https://www.douban.com/people/E-st2000/ 中的 E-st2000"
             )
             return
 
         try:
-            result = await self.client.validate_cookie(cookie)
+            result = await self.client.validate_uid(douban_id)
             if not result:
-                yield event.plain_result("❌ Cookie 验证失败，请检查是否正确。")
+                yield event.plain_result(
+                    "❌ 无法访问该豆瓣主页，请检查ID是否正确。"
+                )
                 return
 
-            await self.db.bind_user(uid, result["uid"], cookie)
-            name = result.get("nickname") or result["uid"]
+            await self.db.bind_user(uid, douban_id)
+            name = result.get("nickname") or douban_id
             yield event.plain_result(f"✅ 绑定成功！豆瓣账号：{name}")
-            logger.info(f"用户 {uid} 绑定豆瓣账号 {result['uid']}")
+            logger.info(f"用户 {uid} 绑定豆瓣账号 {douban_id}")
         except Exception as exc:
             logger.error(f"绑定失败: {exc}")
             yield event.plain_result("❌ 绑定过程中出错，请稍后重试。")
@@ -107,7 +106,9 @@ class DoubanMovie(Star):
         try:
             bind_info = await self.db.get_bind(uid)
             if not bind_info:
-                yield event.plain_result("❌ 未绑定豆瓣账号。使用 /movie bind 绑定。")
+                yield event.plain_result(
+                    "❌ 未绑定豆瓣账号。使用 /movie bind <主页ID> 绑定。"
+                )
                 return
 
             counts = await self.db.get_movie_count(uid)
@@ -120,7 +121,7 @@ class DoubanMovie(Star):
             yield event.plain_result(
                 "📋 豆瓣绑定状态\n"
                 "━━━━━━━━━━━━━━━━━━\n"
-                f"豆瓣UID：{bind_info['douban_uid']}\n"
+                f"豆瓣ID：{bind_info['douban_uid']}\n"
                 f"绑定时间：{bind_info.get('bind_time', '未知')}\n"
                 f"上次同步：{last_sync}\n"
                 f"已同步影片：{total} 部\n"
@@ -139,26 +140,29 @@ class DoubanMovie(Star):
         try:
             bind_info = await self.db.get_bind(uid)
             if not bind_info:
-                yield event.plain_result("❌ 请先使用 /movie bind 绑定豆瓣账号。")
+                yield event.plain_result(
+                    "❌ 请先使用 /movie bind 绑定豆瓣账号。"
+                )
                 return
 
             yield event.plain_result("🔄 开始同步片单，请稍候...")
 
-            last_sync = bind_info.get("last_sync")
-            cookie = bind_info["cookie"]
             douban_uid = bind_info["douban_uid"]
+            last_sync = bind_info.get("last_sync")
+
+            sync_timeout = self.config.get("sync_timeout", 60)
 
             # 带超时的同步
-            sync_timeout = self.config.get("sync_timeout", 60)
             try:
                 results = await asyncio.wait_for(
-                    self.client.fetch_all_collections(douban_uid, cookie, last_sync),
+                    self.client.fetch_all_collections(douban_uid, last_sync),
                     timeout=float(sync_timeout),
                 )
             except asyncio.TimeoutError:
                 await self.db.update_last_sync(uid)
                 yield event.plain_result(
-                    f"⚠️ 同步超时（{sync_timeout}s），已保存已获取的数据。可再次执行同步继续。"
+                    f"⚠️ 同步超时（{sync_timeout}s），已保存已获取的数据。"
+                    "可再次执行同步继续。"
                 )
                 return
 
@@ -173,7 +177,7 @@ class DoubanMovie(Star):
 
             # 补充详情（genres / regions / year）
             if total_new > 0:
-                enrich_limit = self.config.get("detail_enrich_limit", 50)
+                enrich_limit = self.config.get("detail_enrich_limit", 20)
                 await self._enrich_movie_details(uid, min(total_new, enrich_limit))
 
             await self.db.update_last_sync(uid)
@@ -218,7 +222,9 @@ class DoubanMovie(Star):
         try:
             bind_info = await self.db.get_bind(uid)
             if not bind_info:
-                yield event.plain_result("❌ 请先使用 /movie bind 绑定豆瓣账号。")
+                yield event.plain_result(
+                    "❌ 请先使用 /movie bind 绑定豆瓣账号。"
+                )
                 return
 
             counts = await self.db.get_movie_count(uid)
@@ -228,7 +234,11 @@ class DoubanMovie(Star):
                 )
                 return
 
-            text = await self.profile_gen.generate(uid)
+            # 如果配置了 LLM provider 则使用 LLM 辅助
+            provider_id = self.config.get("profile_provider_id", "")
+            context = self.context if provider_id else None
+
+            text = await self.profile_gen.generate(uid, context, provider_id)
             yield event.plain_result(text)
         except Exception as exc:
             logger.error(f"生成画像失败: {exc}")
@@ -243,7 +253,9 @@ class DoubanMovie(Star):
         try:
             bind_info = await self.db.get_bind(uid)
             if not bind_info:
-                yield event.plain_result("❌ 请先使用 /movie bind 绑定豆瓣账号。")
+                yield event.plain_result(
+                    "❌ 请先使用 /movie bind 绑定豆瓣账号。"
+                )
                 return
 
             counts = await self.db.get_movie_count(uid)
@@ -255,7 +267,11 @@ class DoubanMovie(Star):
 
             yield event.plain_result("🔍 正在为你挑选推荐影片...")
 
-            results = await self.recommender.recommend(uid, genre)
+            # 如果配置了 LLM provider 则使用 LLM 生成理由
+            provider_id = self.config.get("recommend_provider_id", "")
+            context = self.context if provider_id else None
+
+            results = await self.recommender.recommend(uid, genre, context, provider_id)
             if not results:
                 suffix = f"（筛选：{genre}）" if genre else ""
                 yield event.plain_result(f"❌ 暂无合适的推荐{suffix}。试试其他类型？")

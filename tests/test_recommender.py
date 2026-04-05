@@ -378,3 +378,276 @@ class TestRecommendEdgeCases:
             assert "title" in r
             assert "reason" in r
             assert "score" in r
+
+
+# ===========================================================================
+# _build_llm_prompt unit tests
+# ===========================================================================
+
+class TestBuildLLMPrompt:
+
+    def test_prompt_contains_role(self):
+        rec = _make_recommender()
+        user_prefs = {"top_genres": [("剧情", 5)], "top_regions": ["美国"]}
+        results = [{"title": "Test", "year": 2020, "avg_rating": 9.0, "genres": "剧情", "regions": "美国"}]
+        prompt = rec._build_llm_prompt(user_prefs, results)
+        assert "影评人" in prompt
+
+    def test_prompt_contains_genres(self):
+        rec = _make_recommender()
+        user_prefs = {"top_genres": [("科幻", 3), ("动作", 2)], "top_regions": ["美国"]}
+        results = [{"title": "T", "year": 2020, "avg_rating": 9.0, "genres": "科幻", "regions": "美国"}]
+        prompt = rec._build_llm_prompt(user_prefs, results)
+        assert "科幻" in prompt
+        assert "3部" in prompt
+
+    def test_prompt_contains_regions(self):
+        rec = _make_recommender()
+        user_prefs = {"top_genres": [("剧情", 5)], "top_regions": ["美国", "日本"]}
+        results = [{"title": "T", "year": 2020, "avg_rating": 9.0, "genres": "剧情", "regions": "美国"}]
+        prompt = rec._build_llm_prompt(user_prefs, results)
+        assert "美国" in prompt
+
+    def test_prompt_contains_movies(self):
+        rec = _make_recommender()
+        user_prefs = {"top_genres": [("剧情", 5)], "top_regions": ["美国"]}
+        results = [
+            {"title": "肖申克的救赎", "year": 1994, "avg_rating": 9.7, "genres": "犯罪,剧情", "regions": "美国"},
+        ]
+        prompt = rec._build_llm_prompt(user_prefs, results)
+        assert "肖申克的救赎" in prompt
+        assert "9.7" in prompt
+
+    def test_prompt_contains_format_instruction(self):
+        rec = _make_recommender()
+        user_prefs = {"top_genres": [("剧情", 5)], "top_regions": ["美国"]}
+        results = [{"title": "T", "year": 2020, "avg_rating": 9.0, "genres": "剧情", "regions": "美国"}]
+        prompt = rec._build_llm_prompt(user_prefs, results)
+        assert "30字" in prompt
+        assert "1." in prompt
+
+
+# ===========================================================================
+# _parse_llm_reasons unit tests
+# ===========================================================================
+
+class TestParseLLMReasons:
+
+    def test_parse_numbered_list(self):
+        rec = _make_recommender()
+        text = "1. 经典剧情片\n2. 视觉震撼\n3. 温馨感人"
+        reasons = rec._parse_llm_reasons(text, 3)
+        assert reasons == ["经典剧情片", "视觉震撼", "温馨感人"]
+
+    def test_parse_chinese_period(self):
+        rec = _make_recommender()
+        text = "1、经典剧情片\n2、视觉震撼"
+        reasons = rec._parse_llm_reasons(text, 2)
+        assert reasons == ["经典剧情片", "视觉震撼"]
+
+    def test_parse_mixed_format(self):
+        rec = _make_recommender()
+        text = "1. 经典剧情片\n2、视觉震撼\n3. 温馨感人"
+        reasons = rec._parse_llm_reasons(text, 3)
+        assert len(reasons) == 3
+
+    def test_parse_partial_match(self):
+        rec = _make_recommender()
+        text = "1. 经典\n2. 震撼"
+        reasons = rec._parse_llm_reasons(text, 3)
+        assert len(reasons) == 2
+
+    def test_parse_no_match(self):
+        rec = _make_recommender()
+        text = "没有编号的文本"
+        reasons = rec._parse_llm_reasons(text, 3)
+        assert reasons == []
+
+    def test_parse_empty_text(self):
+        rec = _make_recommender()
+        reasons = rec._parse_llm_reasons("", 2)
+        assert reasons == []
+
+    def test_parse_fullwidth_period(self):
+        rec = _make_recommender()
+        text = "1．经典剧情\n2．震撼视觉"
+        reasons = rec._parse_llm_reasons(text, 2)
+        assert len(reasons) == 2
+
+
+# ===========================================================================
+# _generate_template_reasons unit tests
+# ===========================================================================
+
+class TestGenerateTemplateReasons:
+
+    def test_genre_match_reason(self):
+        rec = _make_recommender()
+        results = [{"matched_genres": {"剧情", "科幻"}}]
+        rec._generate_template_reasons(results)
+        assert "剧情" in results[0]["reason"] or "科幻" in results[0]["reason"]
+
+    def test_high_score_reason(self):
+        rec = _make_recommender()
+        results = [{"avg_rating": 9.5, "matched_genres": set()}]
+        rec._generate_template_reasons(results)
+        assert "9.5" in results[0]["reason"]
+
+    def test_quote_in_reason(self):
+        rec = _make_recommender()
+        results = [{"quote": "经典之作", "matched_genres": set()}]
+        rec._generate_template_reasons(results)
+        assert "经典之作" in results[0]["reason"]
+
+    def test_default_reason_when_no_match(self):
+        rec = _make_recommender()
+        results = [{"matched_genres": set()}]
+        rec._generate_template_reasons(results)
+        assert results[0]["reason"] == "高分佳作推荐"
+
+    def test_combined_reasons(self):
+        rec = _make_recommender()
+        results = [{"matched_genres": {"剧情"}, "avg_rating": 9.5, "quote": "好电影"}]
+        rec._generate_template_reasons(results)
+        reason = results[0]["reason"]
+        assert "剧情" in reason
+        assert "9.5" in reason
+        assert "好电影" in reason
+
+    def test_empty_results_list(self):
+        rec = _make_recommender()
+        results = []
+        rec._generate_template_reasons(results)  # should not raise
+        assert results == []
+
+    def test_reason_always_set(self):
+        rec = _make_recommender()
+        results = [{"matched_genres": set(), "avg_rating": 8.5}]
+        rec._generate_template_reasons(results)
+        assert "reason" in results[0]
+        assert len(results[0]["reason"]) > 0
+
+
+# ===========================================================================
+# recommend with LLM integration
+# ===========================================================================
+
+class TestRecommendWithLLM:
+
+    def test_llm_success_sets_reasons(self):
+        """When LLM returns valid reasons, they are used instead of template."""
+        top250 = [
+            _top_movie(movie_id="10", avg_rating=9.0, genres="剧情"),
+            _top_movie(movie_id="20", avg_rating=9.0, genres="剧情"),
+        ]
+        rec = _make_recommender(
+            collect_movies=[_collect_movie()],
+            top250=top250,
+            min_rating=8.0,
+        )
+
+        mock_context = MagicMock()
+        mock_resp = MagicMock()
+        mock_resp.completion_text = "1. LLM理由A\n2. LLM理由B"
+        mock_context.llm_generate = AsyncMock(return_value=mock_resp)
+
+        results = run(rec.recommend("user1", "", mock_context, "test-provider"))
+        assert len(results) == 2
+        assert results[0]["reason"] == "LLM理由A"
+        assert results[1]["reason"] == "LLM理由B"
+
+    def test_llm_failure_falls_back_to_template(self):
+        """When LLM raises, falls back to template reasons."""
+        top250 = [_top_movie(movie_id="10", avg_rating=9.0, genres="剧情")]
+        rec = _make_recommender(
+            collect_movies=[_collect_movie(genres="剧情")],
+            top250=top250,
+            min_rating=8.0,
+        )
+
+        mock_context = MagicMock()
+        mock_context.llm_generate = AsyncMock(side_effect=RuntimeError("LLM down"))
+
+        results = run(rec.recommend("user1", "", mock_context, "test-provider"))
+        assert len(results) > 0
+        assert "reason" in results[0]
+        assert len(results[0]["reason"]) > 0
+
+    def test_llm_reasons_count_mismatch_falls_back(self):
+        """When LLM returns wrong number of reasons, falls back to template."""
+        top250 = [
+            _top_movie(movie_id="10", avg_rating=9.0, genres="剧情"),
+            _top_movie(movie_id="20", avg_rating=9.0, genres="剧情"),
+        ]
+        rec = _make_recommender(
+            collect_movies=[_collect_movie()],
+            top250=top250,
+            min_rating=8.0,
+        )
+
+        mock_context = MagicMock()
+        mock_resp = MagicMock()
+        # Only 1 reason for 2 movies -> mismatch -> fallback
+        mock_resp.completion_text = "1. 唯一理由"
+        mock_context.llm_generate = AsyncMock(return_value=mock_resp)
+
+        results = run(rec.recommend("user1", "", mock_context, "test-provider"))
+        assert len(results) == 2
+        # Should have template reasons, not the LLM reason
+        for r in results:
+            assert "reason" in r
+
+    def test_no_context_uses_template(self):
+        """When context is None, template reasons are generated."""
+        top250 = [_top_movie(movie_id="10", avg_rating=9.0, genres="剧情")]
+        rec = _make_recommender(
+            collect_movies=[_collect_movie(genres="剧情")],
+            top250=top250,
+            min_rating=8.0,
+        )
+        results = run(rec.recommend("user1", "", None, ""))
+        assert len(results) > 0
+        assert "reason" in results[0]
+
+    def test_no_provider_id_uses_template(self):
+        """When provider_id is empty, template reasons are generated."""
+        top250 = [_top_movie(movie_id="10", avg_rating=9.0, genres="剧情")]
+        rec = _make_recommender(
+            collect_movies=[_collect_movie(genres="剧情")],
+            top250=top250,
+            min_rating=8.0,
+        )
+        mock_context = MagicMock()
+        results = run(rec.recommend("user1", "", mock_context, ""))
+        assert len(results) > 0
+        assert "reason" in results[0]
+
+    def test_llm_none_response_falls_back(self):
+        """When LLM returns None, falls back to template reasons."""
+        top250 = [_top_movie(movie_id="10", avg_rating=9.0, genres="剧情")]
+        rec = _make_recommender(
+            collect_movies=[_collect_movie(genres="剧情")],
+            top250=top250,
+            min_rating=8.0,
+        )
+        mock_context = MagicMock()
+        mock_context.llm_generate = AsyncMock(return_value=None)
+        results = run(rec.recommend("user1", "", mock_context, "test-provider"))
+        assert len(results) > 0
+        assert "reason" in results[0]
+
+    def test_llm_empty_completion_falls_back(self):
+        """When LLM returns empty completion_text, falls back to template."""
+        top250 = [_top_movie(movie_id="10", avg_rating=9.0, genres="剧情")]
+        rec = _make_recommender(
+            collect_movies=[_collect_movie(genres="剧情")],
+            top250=top250,
+            min_rating=8.0,
+        )
+        mock_context = MagicMock()
+        mock_resp = MagicMock()
+        mock_resp.completion_text = ""
+        mock_context.llm_generate = AsyncMock(return_value=mock_resp)
+        results = run(rec.recommend("user1", "", mock_context, "test-provider"))
+        assert len(results) > 0
+        assert "reason" in results[0]

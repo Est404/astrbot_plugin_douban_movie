@@ -68,6 +68,13 @@ def test_import_db_database():
     assert Database is not None
     assert hasattr(Database, "init")
     assert hasattr(Database, "bind_user")
+    # bind_user should accept exactly 2 args (astrbot_uid, douban_uid) -- no cookie
+    import inspect
+    sig = inspect.signature(Database.bind_user)
+    params = list(sig.parameters.keys())
+    assert params == ["self", "astrbot_uid", "douban_uid"], (
+        f"bind_user signature changed: {params}"
+    )
 
 
 def test_import_service_douban_client():
@@ -76,6 +83,12 @@ def test_import_service_douban_client():
     assert DoubanClient is not None
     assert hasattr(DoubanClient, "fetch_top250")
     assert hasattr(DoubanClient, "_parse_collection_item")
+    assert hasattr(DoubanClient, "validate_uid")
+    # _request should not have cookie parameter
+    import inspect
+    sig = inspect.signature(DoubanClient._request)
+    params = list(sig.parameters.keys())
+    assert "cookie" not in params, f"_request still has cookie param: {params}"
 
 
 def test_import_service_profile():
@@ -83,6 +96,9 @@ def test_import_service_profile():
     from astrbot_plugin_douban_movie.service.profile import ProfileGenerator
     assert ProfileGenerator is not None
     assert hasattr(ProfileGenerator, "generate")
+    assert hasattr(ProfileGenerator, "_collect_stats")
+    assert hasattr(ProfileGenerator, "_format_stats_text")
+    assert hasattr(ProfileGenerator, "_build_llm_prompt")
 
 
 def test_import_service_recommender():
@@ -90,6 +106,9 @@ def test_import_service_recommender():
     from astrbot_plugin_douban_movie.service.recommender import Recommender
     assert Recommender is not None
     assert hasattr(Recommender, "recommend")
+    assert hasattr(Recommender, "_build_llm_prompt")
+    assert hasattr(Recommender, "_parse_llm_reasons")
+    assert hasattr(Recommender, "_generate_template_reasons")
 
 
 def test_relative_import_chain():
@@ -137,6 +156,9 @@ def test_doubanmovie_init_success():
                     "request_interval_min": 1.0,
                     "request_interval_max": 3.0,
                     "max_retries": 3,
+                    "detail_enrich_limit": 20,
+                    "profile_provider_id": "",
+                    "recommend_provider_id": "",
                 }
                 plugin = DoubanMovie(ctx, config)
                 assert plugin.db is not None

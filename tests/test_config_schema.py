@@ -32,6 +32,8 @@ EXPECTED_FIELDS = {
     "request_interval_max",
     "max_retries",
     "detail_enrich_limit",
+    "profile_provider_id",
+    "recommend_provider_id",
 }
 
 # Mapping from schema type string to Python type for default validation
@@ -80,8 +82,12 @@ class TestConfSchemaFieldConstraints:
             assert "description" in field, f"Field '{key}' missing 'description'"
             assert len(field["description"]) > 0, f"Field '{key}' has empty description"
 
-    def test_every_field_has_default(self, schema):
+    def test_every_field_has_default_or_is_provider_select(self, schema):
+        """Fields should have 'default', unless they are provider selectors."""
         for key, field in schema.items():
+            if field.get("_special") == "select_provider":
+                # Provider select fields may omit default (empty string means no provider)
+                continue
             assert "default" in field, f"Field '{key}' missing 'default'"
 
     def test_type_values_are_valid(self, schema):
@@ -93,8 +99,10 @@ class TestConfSchemaFieldConstraints:
             )
 
     def test_default_types_match_declared_types(self, schema):
-        """Default value type must match the declared 'type' field."""
+        """Default value type must match the declared 'type' field (for fields that have defaults)."""
         for key, field in schema.items():
+            if "default" not in field:
+                continue
             declared = field["type"]
             default = field["default"]
             expected_type = TYPE_MAP[declared]
@@ -113,8 +121,8 @@ class TestConfSchemaFieldConstraints:
                 assert len(field["hint"]) > 0, f"Field '{key}' has empty hint"
 
     def test_no_extra_keys_per_field(self, schema):
-        """Each field should only have known keys: type, description, hint, default."""
-        allowed_keys = {"type", "description", "hint", "default"}
+        """Each field should only have known keys: type, description, hint, default, _special."""
+        allowed_keys = {"type", "description", "hint", "default", "_special"}
         for key, field in schema.items():
             extra = set(field.keys()) - allowed_keys
             assert not extra, f"Field '{key}' has unknown keys: {extra}"
@@ -150,3 +158,40 @@ class TestConfSchemaSemanticConstraints:
 
     def test_detail_enrich_limit_positive(self, schema):
         assert schema["detail_enrich_limit"]["default"] > 0
+
+    def test_detail_enrich_limit_default_is_20(self, schema):
+        """After refactor, detail_enrich_limit default changed from 50 to 20."""
+        assert schema["detail_enrich_limit"]["default"] == 20
+
+
+class TestConfSchemaProviderFields:
+    """Validate the new LLM provider configuration fields."""
+
+    def test_profile_provider_id_exists(self, schema):
+        assert "profile_provider_id" in schema
+
+    def test_recommend_provider_id_exists(self, schema):
+        assert "recommend_provider_id" in schema
+
+    def test_provider_fields_are_string_type(self, schema):
+        for key in ("profile_provider_id", "recommend_provider_id"):
+            assert schema[key]["type"] == "string", (
+                f"Field '{key}' should be type 'string', got '{schema[key]['type']}'"
+            )
+
+    def test_provider_fields_have_special_marker(self, schema):
+        for key in ("profile_provider_id", "recommend_provider_id"):
+            assert schema[key].get("_special") == "select_provider", (
+                f"Field '{key}' should have _special='select_provider'"
+            )
+
+    def test_provider_fields_have_description(self, schema):
+        for key in ("profile_provider_id", "recommend_provider_id"):
+            assert "description" in schema[key]
+            assert len(schema[key]["description"]) > 0
+
+    def test_provider_fields_have_hint(self, schema):
+        for key in ("profile_provider_id", "recommend_provider_id"):
+            assert "hint" in schema[key]
+            assert isinstance(schema[key]["hint"], str)
+            assert len(schema[key]["hint"]) > 0

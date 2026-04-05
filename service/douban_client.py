@@ -45,18 +45,14 @@ class DoubanClient:
     # ── 基础请求 ────────────────────────────────────────────
 
     async def _request(
-        self, url: str, cookie: str = "", max_retries: int | None = None
+        self, url: str, max_retries: int | None = None
     ) -> Optional[str]:
-        headers = {**_BASE_HEADERS}
-        if cookie:
-            headers["Cookie"] = cookie
-
         retries = max_retries if max_retries is not None else self._max_retries
 
         for attempt in range(retries):
             try:
                 async with httpx.AsyncClient(
-                    headers=headers, follow_redirects=True, timeout=15.0
+                    headers=_BASE_HEADERS, follow_redirects=True, timeout=15.0
                 ) as client:
                     resp = await client.get(url)
 
@@ -84,47 +80,37 @@ class DoubanClient:
     async def _delay(self):
         await asyncio.sleep(random.uniform(self._interval_min, self._interval_max))
 
-    # ── Cookie 验证 ─────────────────────────────────────────
+    # ── UID 验证 ─────────────────────────────────────────
 
-    async def validate_cookie(self, cookie: str) -> Optional[dict]:
-        """验证 Cookie 有效性并返回 {uid, nickname}。"""
-        html = await self._request("https://www.douban.com/mine/", cookie)
+    async def validate_uid(self, douban_uid: str) -> Optional[dict]:
+        """验证豆瓣主页 ID 是否有效，返回 {uid, nickname}。"""
+        html = await self._request(f"https://www.douban.com/people/{douban_uid}/")
         if not html:
             return None
 
         soup = BeautifulSoup(html, "html.parser")
 
-        # 从页面中提取用户主页链接 → UID
-        profile_link = soup.select_one("a[href*='/people/']")
-        if not profile_link:
-            return None
-
-        href = profile_link.get("href", "")
-        match = re.search(r"/people/([^/]+)/", href)
-        if not match:
-            return None
-
-        uid = match.group(1)
-
-        # 尝试提取昵称
+        # 提取昵称
         nickname = ""
-        nick_elem = soup.select_one(".nav-user-account .name")
-        if nick_elem:
-            nickname = nick_elem.get_text(strip=True)
+        title_elem = soup.select_one("title")
+        if title_elem:
+            text = title_elem.get_text(strip=True)
+            # 页面标题通常是 "昵称的豆瓣主页" 或类似格式
+            nickname = re.sub(r"的豆瓣.*$", "", text).strip()
 
-        return {"uid": uid, "nickname": nickname}
+        return {"uid": douban_uid, "nickname": nickname}
 
     # ── 片单抓取 ────────────────────────────────────────────
 
     async def fetch_collection_page(
-        self, uid: str, cookie: str, status: str, start: int = 0
+        self, uid: str, status: str, start: int = 0
     ) -> tuple[list[dict], bool]:
         """抓取一页片单，返回 (movies, has_more)。"""
         url = (
             f"https://movie.douban.com/people/{uid}/{status}"
             f"?start={start}&sort=time&rating=all&filter=all&mode=grid"
         )
-        html = await self._request(url, cookie)
+        html = await self._request(url)
         if not html:
             return [], False
 
@@ -191,7 +177,6 @@ class DoubanClient:
     async def fetch_all_collections(
         self,
         uid: str,
-        cookie: str,
         last_sync_time: Optional[str] = None,
     ) -> dict[str, list[dict]]:
         """抓取全部片单（想看/在看/看过），支持增量。"""
@@ -202,7 +187,7 @@ class DoubanClient:
             while True:
                 await self._delay()
                 movies, has_more = await self.fetch_collection_page(
-                    uid, cookie, status, start
+                    uid, status, start
                 )
                 if not movies:
                     break

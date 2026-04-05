@@ -217,3 +217,251 @@ class TestProfileEdgeCases:
         gen = ProfileGenerator(db)
         text = run(gen.generate("u"))
         assert "观影画像" in text
+
+
+# ===========================================================================
+# _collect_stats unit tests
+# ===========================================================================
+
+class TestCollectStats:
+
+    def _collect(self, movies):
+        gen = ProfileGenerator(MagicMock())
+        return gen._collect_stats(movies)
+
+    def test_total_count(self):
+        movies = [make_movie() for _ in range(7)]
+        stats = self._collect(movies)
+        assert stats["total"] == 7
+
+    def test_empty_movies(self):
+        stats = self._collect([])
+        assert stats["total"] == 0
+        assert stats["top_genres"] == []
+        assert stats["avg_rating"] == 0
+
+    def test_genre_counts(self):
+        movies = [
+            make_movie(genres="剧情,科幻"),
+            make_movie(genres="剧情"),
+            make_movie(genres="科幻,动作"),
+        ]
+        stats = self._collect(movies)
+        genre_map = {g: s["count"] for g, s in stats["top_genres"]}
+        assert genre_map["剧情"] == 2
+        assert genre_map["科幻"] == 2
+        assert genre_map["动作"] == 1
+
+    def test_genre_limited_to_top5(self):
+        movies = [make_movie(genres=f"类型{i}") for i in range(10)]
+        stats = self._collect(movies)
+        assert len(stats["top_genres"]) <= 5
+
+    def test_genre_ratings_tracked(self):
+        movies = [
+            make_movie(genres="剧情", user_rating=4.0),
+            make_movie(genres="剧情", user_rating=5.0),
+        ]
+        stats = self._collect(movies)
+        drama_entry = [g for g, s in stats["top_genres"] if g == "剧情"]
+        assert len(drama_entry) == 1
+        ratings = dict(stats["top_genres"])["剧情"]["ratings"]
+        assert ratings == [4.0, 5.0]
+
+    def test_region_counts(self):
+        movies = [
+            make_movie(regions="美国,英国"),
+            make_movie(regions="美国"),
+            make_movie(regions="中国"),
+        ]
+        stats = self._collect(movies)
+        region_map = dict(stats["top_regions"])
+        assert region_map["美国"] == 2
+        assert region_map["英国"] == 1
+
+    def test_region_limited_to_top3(self):
+        movies = [make_movie(regions=f"地区{i}") for i in range(10)]
+        stats = self._collect(movies)
+        assert len(stats["top_regions"]) <= 3
+
+    def test_decade_counts(self):
+        movies = [
+            make_movie(year=1995),
+            make_movie(year=1998),
+            make_movie(year=2020),
+        ]
+        stats = self._collect(movies)
+        decade_map = dict(stats["top_decades"])
+        assert decade_map["1990s"] == 2
+        assert decade_map["2020s"] == 1
+
+    def test_avg_rating(self):
+        movies = [
+            make_movie(user_rating=3.0),
+            make_movie(user_rating=5.0),
+        ]
+        stats = self._collect(movies)
+        assert stats["avg_rating"] == pytest.approx(4.0)
+
+    def test_rating_count(self):
+        movies = [
+            make_movie(user_rating=4.0),
+            make_movie(user_rating=None),
+            make_movie(user_rating=3.0),
+        ]
+        stats = self._collect(movies)
+        assert stats["rating_count"] == 2
+
+    def test_null_ratings_excluded_from_avg(self):
+        movies = [
+            make_movie(user_rating=None),
+            make_movie(user_rating=None),
+        ]
+        stats = self._collect(movies)
+        assert stats["avg_rating"] == 0
+        assert stats["rating_count"] == 0
+
+    def test_returns_expected_keys(self):
+        stats = self._collect([make_movie()])
+        expected = {"total", "top_genres", "top_regions", "top_decades", "avg_rating", "rating_count"}
+        assert set(stats.keys()) == expected
+
+
+# ===========================================================================
+# _format_stats_text unit tests
+# ===========================================================================
+
+class TestFormatStatsText:
+
+    def _format(self, movies):
+        gen = ProfileGenerator(MagicMock())
+        stats = gen._collect_stats(movies)
+        return gen._format_stats_text(stats)
+
+    def test_contains_header(self):
+        text = self._format([make_movie()])
+        assert "观影画像" in text
+
+    def test_contains_total(self):
+        text = self._format([make_movie() for _ in range(3)])
+        assert "看过：3 部" in text
+
+    def test_lenient_label(self):
+        text = self._format([make_movie(user_rating=5.0) for _ in range(3)])
+        assert "宽容型" in text
+
+    def test_strict_label(self):
+        text = self._format([make_movie(user_rating=1.0) for _ in range(3)])
+        assert "严厉型" in text
+
+    def test_neutral_label(self):
+        text = self._format([make_movie(user_rating=3.0) for _ in range(3)])
+        assert "中立型" in text
+
+
+# ===========================================================================
+# _build_llm_prompt unit tests
+# ===========================================================================
+
+class TestBuildLLMPrompt:
+
+    def _prompt(self, movies):
+        gen = ProfileGenerator(MagicMock())
+        stats = gen._collect_stats(movies)
+        return gen._build_llm_prompt(stats)
+
+    def test_contains_system_instruction(self):
+        prompt = self._prompt([make_movie()])
+        assert "影评分析师" in prompt
+
+    def test_contains_total_count(self):
+        prompt = self._prompt([make_movie() for _ in range(5)])
+        assert "5 部电影" in prompt
+
+    def test_contains_genre_info(self):
+        prompt = self._prompt([make_movie(genres="剧情")])
+        assert "类型偏好" in prompt
+        assert "剧情" in prompt
+
+    def test_contains_region_info(self):
+        prompt = self._prompt([make_movie(regions="美国")])
+        assert "地区偏好" in prompt
+
+    def test_contains_decade_info(self):
+        prompt = self._prompt([make_movie(year=2020)])
+        assert "年代偏好" in prompt
+
+    def test_output_instruction(self):
+        prompt = self._prompt([make_movie()])
+        assert "200字" in prompt
+
+
+# ===========================================================================
+# generate with LLM integration
+# ===========================================================================
+
+class TestGenerateWithLLM:
+
+    def test_llm_success_appends_stats_text(self):
+        """When LLM returns a result, the output contains both LLM text and stats text."""
+        db = make_db([make_movie(genres="剧情", user_rating=4.0)])
+        gen = ProfileGenerator(db)
+
+        mock_context = MagicMock()
+        mock_resp = MagicMock()
+        mock_resp.completion_text = "你是一位资深影迷"
+        mock_context.llm_generate = AsyncMock(return_value=mock_resp)
+
+        text = run(gen.generate("u", context=mock_context, provider_id="test-provider"))
+        assert "你是一位资深影迷" in text
+        assert "观影画像" in text
+
+    def test_llm_failure_falls_back_to_text(self):
+        """When LLM raises an exception, falls back to pure text."""
+        db = make_db([make_movie(genres="剧情", user_rating=4.0)])
+        gen = ProfileGenerator(db)
+
+        mock_context = MagicMock()
+        mock_context.llm_generate = AsyncMock(side_effect=RuntimeError("LLM unavailable"))
+
+        text = run(gen.generate("u", context=mock_context, provider_id="test-provider"))
+        assert "观影画像" in text
+
+    def test_llm_empty_response_falls_back(self):
+        """When LLM returns empty completion_text, falls back to pure text."""
+        db = make_db([make_movie(genres="剧情", user_rating=4.0)])
+        gen = ProfileGenerator(db)
+
+        mock_context = MagicMock()
+        mock_resp = MagicMock()
+        mock_resp.completion_text = ""
+        mock_context.llm_generate = AsyncMock(return_value=mock_resp)
+
+        text = run(gen.generate("u", context=mock_context, provider_id="test-provider"))
+        assert "观影画像" in text
+
+    def test_llm_none_response_falls_back(self):
+        """When LLM returns None, falls back to pure text."""
+        db = make_db([make_movie(genres="剧情", user_rating=4.0)])
+        gen = ProfileGenerator(db)
+
+        mock_context = MagicMock()
+        mock_context.llm_generate = AsyncMock(return_value=None)
+
+        text = run(gen.generate("u", context=mock_context, provider_id="test-provider"))
+        assert "观影画像" in text
+
+    def test_no_context_uses_text(self):
+        """When context is None, pure text profile is generated."""
+        db = make_db([make_movie(genres="剧情", user_rating=4.0)])
+        gen = ProfileGenerator(db)
+        text = run(gen.generate("u", context=None, provider_id=""))
+        assert "观影画像" in text
+
+    def test_no_provider_id_uses_text(self):
+        """When provider_id is empty, pure text profile is generated."""
+        db = make_db([make_movie(genres="剧情", user_rating=4.0)])
+        gen = ProfileGenerator(db)
+        mock_context = MagicMock()
+        text = run(gen.generate("u", context=mock_context, provider_id=""))
+        assert "观影画像" in text

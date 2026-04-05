@@ -55,10 +55,10 @@ class TestDatabaseInit:
         assert "movie_collection" in tables
 
     async def test_user_bind_schema(self, db):
-        """user_bind table has expected columns."""
+        """user_bind table has expected columns (no cookie after refactor)."""
         cursor = await db._conn.execute("PRAGMA table_info(user_bind)")
         cols = {r["name"] for r in await cursor.fetchall()}
-        expected = {"astrbot_uid", "douban_uid", "cookie", "bind_time", "last_sync"}
+        expected = {"astrbot_uid", "douban_uid", "bind_time", "last_sync"}
         assert expected == cols
 
     async def test_movie_collection_schema(self, db):
@@ -79,12 +79,11 @@ class TestDatabaseInit:
 class TestUserBind:
 
     async def test_bind_and_get(self, db):
-        await db.bind_user("user1", "douban_abc", "cookie123")
+        await db.bind_user("user1", "douban_abc")
         result = await db.get_bind("user1")
         assert result is not None
         assert result["astrbot_uid"] == "user1"
         assert result["douban_uid"] == "douban_abc"
-        assert result["cookie"] == "cookie123"
 
     async def test_get_bind_not_found(self, db):
         result = await db.get_bind("nonexistent")
@@ -92,14 +91,13 @@ class TestUserBind:
 
     async def test_bind_replaces_existing(self, db):
         """Re-binding the same user replaces the old record."""
-        await db.bind_user("user1", "douban_old", "old_cookie")
-        await db.bind_user("user1", "douban_new", "new_cookie")
+        await db.bind_user("user1", "douban_old")
+        await db.bind_user("user1", "douban_new")
         result = await db.get_bind("user1")
         assert result["douban_uid"] == "douban_new"
-        assert result["cookie"] == "new_cookie"
 
     async def test_unbind_user(self, db):
-        await db.bind_user("user1", "douban_abc", "cookie")
+        await db.bind_user("user1", "douban_abc")
         await db.unbind_user("user1")
         result = await db.get_bind("user1")
         assert result is None
@@ -110,8 +108,8 @@ class TestUserBind:
 
     async def test_multiple_users_isolated(self, db):
         """Multiple users' bindings are isolated."""
-        await db.bind_user("u1", "d1", "c1")
-        await db.bind_user("u2", "d2", "c2")
+        await db.bind_user("u1", "d1")
+        await db.bind_user("u2", "d2")
         r1 = await db.get_bind("u1")
         r2 = await db.get_bind("u2")
         assert r1["douban_uid"] == "d1"
@@ -334,13 +332,13 @@ class TestMoviesWithoutDetails:
 class TestUpdateLastSync:
 
     async def test_sets_last_sync(self, db):
-        await db.bind_user("u1", "d1", "cookie")
+        await db.bind_user("u1", "d1")
         await db.update_last_sync("u1")
         bind = await db.get_bind("u1")
         assert bind["last_sync"] is not None
 
     async def test_last_sync_changes_on_update(self, db):
-        await db.bind_user("u1", "d1", "cookie")
+        await db.bind_user("u1", "d1")
         await db.update_last_sync("u1")
         first = (await db.get_bind("u1"))["last_sync"]
 
@@ -361,7 +359,7 @@ class TestUpdateLastSync:
 class TestUnbindCascading:
 
     async def test_unbind_removies_all_user_movies(self, db):
-        await db.bind_user("u1", "d1", "cookie")
+        await db.bind_user("u1", "d1")
         await db.upsert_movie("u1", {"douban_movie_id": "1", "title": "A", "status": "collect"})
         await db.upsert_movie("u1", {"douban_movie_id": "2", "title": "B", "status": "wish"})
         await db.commit_batch()
@@ -375,8 +373,8 @@ class TestUnbindCascading:
         assert movies == []
 
     async def test_unbind_does_not_affect_other_users(self, db):
-        await db.bind_user("u1", "d1", "c1")
-        await db.bind_user("u2", "d2", "c2")
+        await db.bind_user("u1", "d1")
+        await db.bind_user("u2", "d2")
         await db.upsert_movie("u1", {"douban_movie_id": "1", "title": "A", "status": "collect"})
         await db.upsert_movie("u2", {"douban_movie_id": "2", "title": "B", "status": "collect"})
         await db.commit_batch()

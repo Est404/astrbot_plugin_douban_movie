@@ -39,6 +39,18 @@
     "description": "单次同步后补充影片详情的最大数量",
     "type": "int",
     "hint": "同步后会为缺少类型/地区信息的影片抓取详情，此值控制每次补充的上限",
-    "default": 50
+    "default": 20
+  },
+  "profile_provider_id": {
+    "description": "生成用户画像使用的LLM模型",
+    "type": "string",
+    "_special": "select_provider",
+    "hint": "选择用于画像分析的模型提供商，留空则使用纯统计输出"
+  },
+  "recommend_provider_id": {
+    "description": "生成推荐时使用的LLM模型",
+    "type": "string",
+    "_special": "select_provider",
+    "hint": "选择用于推荐理由生成的模型提供商，留空则使用模板理由"
   }
 }

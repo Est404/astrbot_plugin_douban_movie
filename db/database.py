@@ -23,7 +23,6 @@ class Database:
             CREATE TABLE IF NOT EXISTS user_bind (
                 astrbot_uid  TEXT PRIMARY KEY,
                 douban_uid   TEXT NOT NULL,
-                cookie       TEXT NOT NULL,
                 bind_time    DATETIME DEFAULT CURRENT_TIMESTAMP,
                 last_sync    DATETIME
             );
@@ -52,11 +51,11 @@ class Database:
 
     # ── user_bind ──────────────────────────────────────────────
 
-    async def bind_user(self, astrbot_uid: str, douban_uid: str, cookie: str):
+    async def bind_user(self, astrbot_uid: str, douban_uid: str):
         await self._conn.execute(
-            "INSERT OR REPLACE INTO user_bind (astrbot_uid, douban_uid, cookie) "
-            "VALUES (?, ?, ?)",
-            (astrbot_uid, douban_uid, cookie),
+            "INSERT OR REPLACE INTO user_bind (astrbot_uid, douban_uid) "
+            "VALUES (?, ?)",
+            (astrbot_uid, douban_uid),
         )
         await self._conn.commit()
 
