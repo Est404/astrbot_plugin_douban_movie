@@ -5,6 +5,7 @@ import asyncio
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools
+from astrbot.api.util import SessionController, session_waiter
 
 from .db.database import Database
 from .service.douban_client import DoubanClient
@@ -26,12 +27,13 @@ class DoubanMovie(Star):
             max_retries=config.get("max_retries", 3),
             cookie=config.get("douban_cookie", ""),
         )
-        self.profile_gen = ProfileGenerator(self.db)
+        self.profile_gen = ProfileGenerator(self.db, self.client)
         self.recommender = Recommender(
             self.db,
             self.client,
             recommend_count=config.get("recommend_count", 5),
-            min_rating=config.get("min_rating", 8.0),
+            candidate_pool_size=config.get("candidate_pool_size", 20),
+            min_rating=config.get("min_rating", 7.0),
         )
 
         asyncio.create_task(self._init_db())
@@ -39,6 +41,29 @@ class DoubanMovie(Star):
 
     async def _init_db(self):
         await self.db.init()
+
+    # ── 人格注入辅助 ────────────────────────────────────────
+
+    async def _resolve_persona_text(self, event: AstrMessageEvent) -> str:
+        """获取当前会话的人格提示词。"""
+        try:
+            umo = event.unified_msg_origin
+            cid = await self.context.conversation_manager.get_curr_conversation_id(umo)
+            if not cid:
+                return ""
+            conv = await self.context.conversation_manager.get_conversation(
+                unified_msg_origin=umo,
+                conversation_id=cid,
+            )
+            if conv and conv.persona_id:
+                persona = self.context.persona_manager.get_persona_v3_by_id(
+                    conv.persona_id
+                )
+                if persona and persona.get("prompt"):
+                    return persona["prompt"]
+        except Exception as exc:
+            logger.debug(f"获取人格信息失败: {exc}")
+        return ""
 
     # ── 指令组 ─────────────────────────────────────────────
 
@@ -51,30 +76,53 @@ class DoubanMovie(Star):
 
     @movie.command("bind")
     async def bind(self, event: AstrMessageEvent, douban_id: str = ""):
-        """绑定豆瓣主页ID"""
+        """绑定豆瓣数字ID"""
         uid = event.get_sender_id()
 
         if not douban_id:
             yield event.plain_result(
-                "使用方法：/movie bind <豆瓣主页ID>\n\n"
-                "示例：/movie bind E-st2000\n\n"
-                "主页ID 是你豆瓣个人主页 URL 中 /people/ 后面的部分。\n"
-                "例如 https://www.douban.com/people/E-st2000/ 中的 E-st2000"
+                "使用方法：/movie bind <豆瓣数字ID或主页链接>\n\n"
+                "示例：\n"
+                "  /movie bind 159896279\n"
+                "  /movie bind https://www.douban.com/people/159896279/\n\n"
+                "数字ID 是你豆瓣个人主页 URL 中 /people/ 后面的数字。"
             )
             return
 
         try:
-            result = await self.client.validate_uid(douban_id)
-            if not result:
+            # 提取数字 ID
+            numeric_id = DoubanClient.extract_numeric_id(douban_id)
+            if not numeric_id:
                 yield event.plain_result(
-                    "❌ 无法访问该豆瓣主页，请检查ID是否正确。"
+                    "❌ 无法识别豆瓣数字ID。请输入纯数字或完整的主页链接。"
                 )
                 return
 
-            await self.db.bind_user(uid, douban_id)
-            name = result.get("nickname") or douban_id
-            yield event.plain_result(f"✅ 绑定成功！豆瓣账号：{name}")
-            logger.info(f"用户 {uid} 绑定豆瓣账号 {douban_id}")
+            # 验证
+            result = await self.client.validate_douban_uid(numeric_id)
+            if not result:
+                if self.client.cookie_expired:
+                    yield event.plain_result(
+                        "❌ 豆瓣 Cookie 已失效，请联系管理员更新。"
+                    )
+                    return
+                yield event.plain_result(
+                    "❌ 无法访问该豆瓣用户数据，请检查ID是否正确。"
+                )
+                return
+
+            # 绑定
+            await self.db.bind_user(
+                uid, numeric_id, nickname=result.get("nickname")
+            )
+            name = result.get("nickname") or numeric_id
+            total = result.get("total_marked", 0)
+            yield event.plain_result(
+                f"✅ 绑定成功！\n"
+                f"豆瓣昵称：{name}\n"
+                f"标记数量：{total} 部"
+            )
+            logger.info(f"用户 {uid} 绑定豆瓣账号 {numeric_id}")
         except Exception as exc:
             logger.error(f"绑定失败: {exc}")
             yield event.plain_result("❌ 绑定过程中出错，请稍后重试。")
@@ -92,7 +140,7 @@ class DoubanMovie(Star):
                 return
 
             await self.db.unbind_user(uid)
-            yield event.plain_result("✅ 已解绑豆瓣账号，片单数据已清除。")
+            yield event.plain_result("✅ 已解绑豆瓣账号，所有数据已清除。")
             logger.info(f"用户 {uid} 解绑豆瓣账号")
         except Exception as exc:
             logger.error(f"解绑失败: {exc}")
@@ -108,173 +156,32 @@ class DoubanMovie(Star):
             bind_info = await self.db.get_bind(uid)
             if not bind_info:
                 yield event.plain_result(
-                    "❌ 未绑定豆瓣账号。使用 /movie bind <主页ID> 绑定。"
+                    "❌ 未绑定豆瓣账号。使用 /movie bind <数字ID> 绑定。"
                 )
                 return
 
-            counts = await self.db.get_movie_count(uid)
-            wish = counts.get("wish", 0)
-            do = counts.get("do", 0)
-            collect = counts.get("collect", 0)
-            total = wish + do + collect
-            last_sync = bind_info.get("last_sync") or "从未"
+            douban_uid = bind_info["douban_uid"]
+            nickname = bind_info.get("nickname") or douban_uid
+            last_profile = bind_info.get("last_profile") or "从未"
+
+            profile = await self.db.get_profile(uid)
+            has_profile = "是" if profile else "否"
+
+            seen_count = len(await self.db.get_seen_movie_ids(uid))
 
             yield event.plain_result(
                 "📋 豆瓣绑定状态\n"
                 "━━━━━━━━━━━━━━━━━━\n"
-                f"豆瓣ID：{bind_info['douban_uid']}\n"
+                f"豆瓣ID：{douban_uid}\n"
+                f"昵称：{nickname}\n"
                 f"绑定时间：{bind_info.get('bind_time', '未知')}\n"
-                f"上次同步：{last_sync}\n"
-                f"已同步影片：{total} 部\n"
-                f"  想看 {wish} · 在看 {do} · 看过 {collect}"
+                f"已生成画像：{has_profile}\n"
+                f"上次画像更新：{last_profile}\n"
+                f"已排除影片：{seen_count} 部"
             )
         except Exception as exc:
             logger.error(f"查询状态失败: {exc}")
             yield event.plain_result("❌ 查询过程中出错，请稍后重试。")
-
-    # ── sync ───────────────────────────────────────────────
-
-    @movie.command("sync")
-    async def sync(self, event: AstrMessageEvent):
-        """同步豆瓣片单"""
-        uid = event.get_sender_id()
-        try:
-            bind_info = await self.db.get_bind(uid)
-            if not bind_info:
-                yield event.plain_result(
-                    "❌ 请先使用 /movie bind 绑定豆瓣账号。"
-                )
-                return
-
-            # ── 预估算 ──
-            yield event.plain_result("🔄 正在获取片单概览...")
-            douban_uid = bind_info["douban_uid"]
-            last_sync = bind_info.get("last_sync")
-
-            try:
-                counts_estimate = await self.client.fetch_collection_counts(douban_uid)
-            except Exception:
-                counts_estimate = {}
-
-            total_est = sum(counts_estimate.values()) if counts_estimate else 0
-            avg_delay = (self.config.get("request_interval_min", 1.0) + self.config.get("request_interval_max", 3.0)) / 2
-            pages_est = sum((c + 14) // 15 for c in counts_estimate.values()) if counts_estimate else 0
-            time_est = pages_est * avg_delay
-            time_min = int(time_est // 60)
-            time_sec = int(time_est % 60)
-
-            est_parts = []
-            for key, label in [("wish", "想看"), ("do", "在看"), ("collect", "看过")]:
-                if counts_estimate.get(key):
-                    est_parts.append(f"{label} {counts_estimate[key]}")
-            est_str = " · ".join(est_parts) if est_parts else "未知"
-
-            yield event.plain_result(
-                f"📋 预计片单：{est_str}（共 {total_est} 部）\n"
-                f"⏱️ 预计耗时：约 {time_min}分{time_sec:02d}秒\n\n"
-                f"开始同步..."
-            )
-
-            # ── 逐页抓取 + 即时写入 + 断点续传 ──
-            sync_timeout = float(self.config.get("sync_timeout", 180))
-            progress = await self.db.get_sync_progress(uid)
-
-            counts = {"wish": 0, "do": 0, "collect": 0}
-            timed_out = False
-
-            try:
-                async with asyncio.timeout(sync_timeout):
-                    for status_type in ("wish", "do", "collect"):
-                        # 断点续传
-                        if status_type in progress:
-                            start = progress[status_type]["last_start"]
-                            counts[status_type] = progress[status_type]["fetched"]
-                            logger.info(
-                                f"用户 {uid} {status_type} 断点续传: start={start}"
-                            )
-                        else:
-                            start = 0
-
-                        while True:
-                            await self.client._delay()
-                            movies, has_more = (
-                                await self.client.fetch_collection_page(
-                                    douban_uid, status_type, start
-                                )
-                            )
-                            if not movies:
-                                break
-
-                            # 增量过滤：跳过上次同步之前标记的
-                            if last_sync and status_type not in progress:
-                                new_movies = []
-                                for m in movies:
-                                    if m.get("marked_at") and m["marked_at"] > last_sync:
-                                        new_movies.append(m)
-                                    else:
-                                        has_more = False
-                                        break
-                                movies = new_movies
-
-                            # 即时写入
-                            for movie in movies:
-                                await self.db.upsert_movie(uid, movie)
-                            await self.db.commit_batch()
-                            counts[status_type] += len(movies)
-
-                            # 保存断点
-                            start += 15
-                            await self.db.save_sync_progress(
-                                uid, status_type, start, counts[status_type]
-                            )
-
-                            if not has_more:
-                                break
-            except asyncio.TimeoutError:
-                timed_out = True
-                logger.warning(f"用户 {uid} 同步超时，已保存部分数据")
-
-            total_new = sum(counts.values())
-
-            # 补充详情（genres / regions / year）
-            enrich_limit = self.config.get("detail_enrich_limit", 50)
-            if total_new > 0:
-                await self._enrich_movie_details(uid, enrich_limit)
-
-            # 同步完成：清除断点 & 更新时间
-            if not timed_out:
-                await self.db.clear_sync_progress(uid)
-            await self.db.update_last_sync(uid)
-
-            wish, do, collect = counts["wish"], counts["do"], counts["collect"]
-            msg = f"✅ 同步完成！已同步 {total_new} 部影片\n"
-            msg += f"想看 {wish} · 在看 {do} · 看过 {collect}"
-            if timed_out:
-                msg += f"\n\n⚠️ 部分片单因超时未完成，可再次执行同步继续。"
-            yield event.plain_result(msg)
-            logger.info(f"用户 {uid} 同步了 {total_new} 部影片")
-        except Exception as exc:
-            logger.error(f"同步失败: {exc}")
-            yield event.plain_result("❌ 同步过程中出错，请稍后重试。")
-
-    async def _enrich_movie_details(self, uid: str, limit: int):
-        """为缺少详情的影片补充类型/地区/年份。"""
-        movie_ids = await self.db.get_movies_without_details(uid, limit)
-        if not movie_ids:
-            return
-
-        logger.info(f"开始补充 {len(movie_ids)} 部影片详情...")
-        for movie_id in movie_ids:
-            detail = await self.client.fetch_movie_detail(movie_id)
-            if detail:
-                await self.db.update_movie_details(
-                    movie_id,
-                    uid,
-                    detail.get("genres", ""),
-                    detail.get("regions", ""),
-                    detail.get("year"),
-                )
-        await self.db.commit_batch()
 
     # ── profile ────────────────────────────────────────────
 
@@ -283,25 +190,16 @@ class DoubanMovie(Star):
         """生成观影画像"""
         uid = event.get_sender_id()
         try:
-            bind_info = await self.db.get_bind(uid)
-            if not bind_info:
-                yield event.plain_result(
-                    "❌ 请先使用 /movie bind 绑定豆瓣账号。"
-                )
-                return
-
-            counts = await self.db.get_movie_count(uid)
-            if counts.get("collect", 0) == 0:
-                yield event.plain_result(
-                    "❌ 暂无观影数据，请先使用 /movie sync 同步片单。"
-                )
-                return
-
-            # 如果配置了 LLM provider 则使用 LLM 辅助
             provider_id = self.config.get("profile_provider_id", "")
+            persona_text = await self._resolve_persona_text(event)
             context = self.context if provider_id else None
 
-            text = await self.profile_gen.generate(uid, context, provider_id)
+            text = await self.profile_gen.generate(
+                astrbot_uid=uid,
+                persona_text=persona_text,
+                context=context,
+                provider_id=provider_id,
+            )
             yield event.plain_result(text)
         except Exception as exc:
             logger.error(f"生成画像失败: {exc}")
@@ -310,7 +208,7 @@ class DoubanMovie(Star):
     # ── rec / recommend ────────────────────────────────────
 
     @movie.command("rec", alias={"recommend"})
-    async def recommend(self, event: AstrMessageEvent, genre: str = ""):
+    async def recommend(self, event: AstrMessageEvent, keyword: str = ""):
         """推荐电影"""
         uid = event.get_sender_id()
         try:
@@ -321,43 +219,102 @@ class DoubanMovie(Star):
                 )
                 return
 
-            counts = await self.db.get_movie_count(uid)
-            if counts.get("collect", 0) == 0:
+            profile = await self.db.get_profile(uid)
+            if not profile:
                 yield event.plain_result(
-                    "❌ 请先使用 /movie sync 同步片单，以便了解你的口味。"
+                    "❌ 请先使用 /movie profile 生成观影画像。"
                 )
                 return
 
-            yield event.plain_result("🔍 正在为你挑选推荐影片...")
+            yield event.plain_result("🔍 正在为你搜索并挑选推荐影片...")
 
-            # 如果配置了 LLM provider 则使用 LLM 生成理由
             provider_id = self.config.get("recommend_provider_id", "")
+            persona_text = await self._resolve_persona_text(event)
             context = self.context if provider_id else None
 
-            results = await self.recommender.recommend(uid, genre, context, provider_id)
+            results, session_id = await self.recommender.search_and_recommend(
+                astrbot_uid=uid,
+                user_description=keyword,
+                persona_text=persona_text,
+                context=context,
+                provider_id=provider_id,
+            )
+
             if not results:
-                suffix = f"（筛选：{genre}）" if genre else ""
-                yield event.plain_result(f"❌ 暂无合适的推荐{suffix}。试试其他类型？")
+                suffix = f"（关键词：{keyword}）" if keyword else ""
+                yield event.plain_result(f"❌ 暂无合适的推荐{suffix}。试试其他关键词？")
                 return
 
-            lines = []
-            if genre:
-                lines.append(f"🎬 为你推荐「{genre}」：")
-            else:
-                lines.append("🎬 为你推荐：")
-            lines.append("━━━━━━━━━━━━━━━━━━")
+            # 格式化推荐结果
+            output = self._format_recommendations(results, keyword)
+            output += "\n\n💡 回复「看过了」重新推荐"
 
-            for i, r in enumerate(results, 1):
-                rating = f"⭐{r['avg_rating']}" if r.get("avg_rating") else ""
-                year = f"({r['year']})" if r.get("year") else ""
-                lines.append(f"\n{i}. {r['title']} {year} {rating}")
-                if r.get("reason"):
-                    lines.append(f"   💡 {r['reason']}")
+            yield event.plain_result(output)
 
-            yield event.plain_result("\n".join(lines))
+            # 等待用户反馈
+            @session_waiter(timeout=120)
+            async def feedback_waiter(
+                controller: SessionController, fb_event: AstrMessageEvent
+            ):
+                msg = fb_event.message_str.strip()
+                if "看过了" not in msg:
+                    controller.stop()
+                    return
+
+                # 重新推荐
+                new_results = await self.recommender.re_recommend(
+                    session_id=session_id,
+                    astrbot_uid=uid,
+                    persona_text=persona_text,
+                    context=context,
+                    provider_id=provider_id,
+                )
+
+                if not new_results:
+                    await fb_event.send(
+                        fb_event.plain_result(
+                            "😔 候选影片已耗尽，请更换关键词或稍后再试。"
+                        )
+                    )
+                    controller.stop()
+                    return
+
+                new_output = self._format_recommendations(new_results[0], keyword)
+                new_output += "\n\n💡 回复「看过了」重新推荐"
+                await fb_event.send(fb_event.plain_result(new_output))
+
+                # 更新 session_id（re_recommend 返回同一个）
+                controller.keep(timeout=120, reset_timeout=True)
+
+            try:
+                await feedback_waiter(event)
+            except TimeoutError:
+                pass
+            finally:
+                event.stop_event()
+
         except Exception as exc:
             logger.error(f"推荐失败: {exc}")
             yield event.plain_result("❌ 推荐过程中出错，请稍后重试。")
+
+    @staticmethod
+    def _format_recommendations(results: list[dict], keyword: str = "") -> str:
+        """格式化推荐结果为文本。"""
+        lines = []
+        if keyword:
+            lines.append(f"🎬 为你推荐「{keyword}」：")
+        else:
+            lines.append("🎬 为你推荐：")
+        lines.append("━━━━━━━━━━━━━━━━━━")
+
+        for i, r in enumerate(results, 1):
+            rating = f"⭐{r['rating']}" if r.get("rating") else ""
+            year = f"({r['year']})" if r.get("year") else ""
+            lines.append(f"\n{i}. 《{r['title']}》{year} {rating}")
+            if r.get("reason"):
+                lines.append(f"   💡 {r['reason']}")
+
+        return "\n".join(lines)
 
     # ── 生命周期 ───────────────────────────────────────────
 

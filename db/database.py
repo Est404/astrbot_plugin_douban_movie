@@ -1,5 +1,7 @@
+import json
 import sqlite3
 from pathlib import Path
+from typing import Optional
 
 import aiosqlite
 from astrbot.api import logger
@@ -23,30 +25,38 @@ class Database:
             CREATE TABLE IF NOT EXISTS user_bind (
                 astrbot_uid  TEXT PRIMARY KEY,
                 douban_uid   TEXT NOT NULL,
+                nickname     TEXT,
                 bind_time    DATETIME DEFAULT CURRENT_TIMESTAMP,
-                last_sync    DATETIME
+                last_profile DATETIME
             );
 
-            CREATE TABLE IF NOT EXISTS movie_collection (
-                douban_movie_id  TEXT,
-                astrbot_uid      TEXT,
-                title            TEXT,
-                user_rating      REAL,
-                genres           TEXT,
-                regions          TEXT,
-                year             INTEGER,
-                status           TEXT,
-                marked_at        DATETIME,
-                fetched_at       DATETIME DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (douban_movie_id, astrbot_uid)
+            CREATE TABLE IF NOT EXISTS user_profile (
+                astrbot_uid      TEXT PRIMARY KEY,
+                profile_text     TEXT,
+                raw_stats        TEXT,
+                genre_prefs      TEXT,
+                region_prefs     TEXT,
+                decade_prefs     TEXT,
+                total_marked     INTEGER,
+                updated_at       DATETIME DEFAULT CURRENT_TIMESTAMP
             );
 
-            CREATE TABLE IF NOT EXISTS sync_progress (
-                astrbot_uid  TEXT,
-                status_type  TEXT,
-                last_start  INTEGER DEFAULT 0,
-                fetched     INTEGER DEFAULT 0,
-                PRIMARY KEY (astrbot_uid, status_type)
+            CREATE TABLE IF NOT EXISTS user_seen_movies (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                astrbot_uid     TEXT NOT NULL,
+                douban_movie_id TEXT NOT NULL,
+                title           TEXT,
+                created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(astrbot_uid, douban_movie_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS rec_session (
+                session_id    TEXT PRIMARY KEY,
+                astrbot_uid   TEXT NOT NULL,
+                keyword       TEXT,
+                candidate_ids TEXT,
+                shown_ids     TEXT,
+                created_at    DATETIME DEFAULT CURRENT_TIMESTAMP
             );
             """
         )
@@ -59,11 +69,13 @@ class Database:
 
     # ── user_bind ──────────────────────────────────────────────
 
-    async def bind_user(self, astrbot_uid: str, douban_uid: str):
+    async def bind_user(
+        self, astrbot_uid: str, douban_uid: str, nickname: Optional[str] = None
+    ):
         await self._conn.execute(
-            "INSERT OR REPLACE INTO user_bind (astrbot_uid, douban_uid) "
-            "VALUES (?, ?)",
-            (astrbot_uid, douban_uid),
+            "INSERT OR REPLACE INTO user_bind (astrbot_uid, douban_uid, nickname) "
+            "VALUES (?, ?, ?)",
+            (astrbot_uid, douban_uid, nickname),
         )
         await self._conn.commit()
 
@@ -72,123 +84,138 @@ class Database:
             "DELETE FROM user_bind WHERE astrbot_uid = ?", (astrbot_uid,)
         )
         await self._conn.execute(
-            "DELETE FROM movie_collection WHERE astrbot_uid = ?", (astrbot_uid,)
+            "DELETE FROM user_profile WHERE astrbot_uid = ?", (astrbot_uid,)
+        )
+        await self._conn.execute(
+            "DELETE FROM user_seen_movies WHERE astrbot_uid = ?", (astrbot_uid,)
+        )
+        await self._conn.execute(
+            "DELETE FROM rec_session WHERE astrbot_uid = ?", (astrbot_uid,)
         )
         await self._conn.commit()
 
-    async def get_bind(self, astrbot_uid: str) -> dict | None:
+    async def get_bind(self, astrbot_uid: str) -> Optional[dict]:
         cursor = await self._conn.execute(
             "SELECT * FROM user_bind WHERE astrbot_uid = ?", (astrbot_uid,)
         )
         row = await cursor.fetchone()
         return dict(row) if row else None
 
-    async def update_last_sync(self, astrbot_uid: str):
+    async def update_last_profile(self, astrbot_uid: str):
         await self._conn.execute(
-            "UPDATE user_bind SET last_sync = CURRENT_TIMESTAMP "
+            "UPDATE user_bind SET last_profile = CURRENT_TIMESTAMP "
             "WHERE astrbot_uid = ?",
             (astrbot_uid,),
         )
         await self._conn.commit()
 
-    # ── sync_progress ──────────────────────────────────────────
+    # ── user_profile ───────────────────────────────────────────
 
-    async def get_sync_progress(self, astrbot_uid: str) -> dict[str, dict]:
-        """返回 {status_type: {last_start, fetched}} 的进度映射。"""
-        cursor = await self._conn.execute(
-            "SELECT status_type, last_start, fetched FROM sync_progress "
-            "WHERE astrbot_uid = ?",
-            (astrbot_uid,),
-        )
-        rows = await cursor.fetchall()
-        return {r["status_type"]: {"last_start": r["last_start"], "fetched": r["fetched"]} for r in rows}
-
-    async def save_sync_progress(
-        self, astrbot_uid: str, status_type: str, last_start: int, fetched: int
+    async def save_profile(
+        self,
+        astrbot_uid: str,
+        profile_text: str,
+        raw_stats: dict,
+        genre_prefs: list,
+        region_prefs: list,
+        decade_prefs: list,
+        total_marked: int,
     ):
         await self._conn.execute(
-            "INSERT OR REPLACE INTO sync_progress (astrbot_uid, status_type, last_start, fetched) "
-            "VALUES (?, ?, ?, ?)",
-            (astrbot_uid, status_type, last_start, fetched),
-        )
-        await self._conn.commit()
-
-    async def clear_sync_progress(self, astrbot_uid: str):
-        await self._conn.execute(
-            "DELETE FROM sync_progress WHERE astrbot_uid = ?", (astrbot_uid,)
-        )
-        await self._conn.commit()
-
-    # ── movie_collection ───────────────────────────────────────
-
-    async def upsert_movie(self, astrbot_uid: str, movie: dict):
-        await self._conn.execute(
-            "INSERT OR REPLACE INTO movie_collection "
-            "(douban_movie_id, astrbot_uid, title, user_rating, genres, regions, "
-            "year, status, marked_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT OR REPLACE INTO user_profile "
+            "(astrbot_uid, profile_text, raw_stats, genre_prefs, region_prefs, "
+            "decade_prefs, total_marked, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
             (
-                movie["douban_movie_id"],
                 astrbot_uid,
-                movie.get("title", ""),
-                movie.get("user_rating"),
-                movie.get("genres", ""),
-                movie.get("regions", ""),
-                movie.get("year"),
-                movie["status"],
-                movie.get("marked_at"),
+                profile_text,
+                json.dumps(raw_stats, ensure_ascii=False),
+                json.dumps(genre_prefs, ensure_ascii=False),
+                json.dumps(region_prefs, ensure_ascii=False),
+                json.dumps(decade_prefs, ensure_ascii=False),
+                total_marked,
             ),
         )
-
-    async def commit_batch(self):
         await self._conn.commit()
 
-    async def get_movies_by_status(self, astrbot_uid: str, status: str) -> list[dict]:
+    async def get_profile(self, astrbot_uid: str) -> Optional[dict]:
         cursor = await self._conn.execute(
-            "SELECT * FROM movie_collection WHERE astrbot_uid = ? AND status = ?",
-            (astrbot_uid, status),
+            "SELECT * FROM user_profile WHERE astrbot_uid = ?", (astrbot_uid,)
         )
-        rows = await cursor.fetchall()
-        return [dict(r) for r in rows]
+        row = await cursor.fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        # Parse JSON fields
+        for key in ("raw_stats", "genre_prefs", "region_prefs", "decade_prefs"):
+            if d.get(key):
+                try:
+                    d[key] = json.loads(d[key])
+                except (json.JSONDecodeError, TypeError):
+                    d[key] = None
+        return d
 
-    async def get_all_collected_movie_ids(self, astrbot_uid: str) -> set[str]:
+    # ── user_seen_movies ───────────────────────────────────────
+
+    async def add_seen_movies(self, astrbot_uid: str, movies: list[dict]):
+        """批量添加已看过电影记录。movies: [{douban_movie_id, title}]"""
+        for m in movies:
+            await self._conn.execute(
+                "INSERT OR IGNORE INTO user_seen_movies "
+                "(astrbot_uid, douban_movie_id, title) VALUES (?, ?, ?)",
+                (astrbot_uid, m["douban_movie_id"], m.get("title", "")),
+            )
+        await self._conn.commit()
+
+    async def get_seen_movie_ids(self, astrbot_uid: str) -> set[str]:
         cursor = await self._conn.execute(
-            "SELECT douban_movie_id FROM movie_collection "
-            "WHERE astrbot_uid = ? AND status IN ('collect', 'wish')",
+            "SELECT douban_movie_id FROM user_seen_movies WHERE astrbot_uid = ?",
             (astrbot_uid,),
         )
         rows = await cursor.fetchall()
         return {r["douban_movie_id"] for r in rows}
 
-    async def get_movie_count(self, astrbot_uid: str) -> dict[str, int]:
-        cursor = await self._conn.execute(
-            "SELECT status, COUNT(*) as cnt FROM movie_collection "
-            "WHERE astrbot_uid = ? GROUP BY status",
-            (astrbot_uid,),
-        )
-        rows = await cursor.fetchall()
-        return {r["status"]: r["cnt"] for r in rows}
+    # ── rec_session ────────────────────────────────────────────
 
-    async def get_movies_without_details(
-        self, astrbot_uid: str, limit: int = 50
-    ) -> list[str]:
-        cursor = await self._conn.execute(
-            "SELECT douban_movie_id FROM movie_collection "
-            "WHERE astrbot_uid = ? AND (genres IS NULL OR genres = '' OR genres = ' ')",
-            (astrbot_uid,),
-        )
-        rows = await cursor.fetchall()
-        return [r["douban_movie_id"] for r in rows[:limit]]
-
-    async def update_movie_details(
+    async def create_rec_session(
         self,
-        douban_movie_id: str,
+        session_id: str,
         astrbot_uid: str,
-        genres: str,
-        regions: str,
-        year: int | None,
+        keyword: str,
+        candidate_ids: list[str],
     ):
         await self._conn.execute(
-            "UPDATE movie_collection SET genres = ?, regions = ?, year = ? "
-            "WHERE douban_movie_id = ? AND astrbot_uid = ?",
-            (genres, regions, year, douban_movie_id, astrbot_uid),
+            "INSERT OR REPLACE INTO rec_session "
+            "(session_id, astrbot_uid, keyword, candidate_ids, shown_ids) "
+            "VALUES (?, ?, ?, ?, '[]')",
+            (
+                session_id,
+                astrbot_uid,
+                keyword,
+                json.dumps(candidate_ids),
+            ),
         )
+        await self._conn.commit()
+
+    async def get_rec_session(self, session_id: str) -> Optional[dict]:
+        cursor = await self._conn.execute(
+            "SELECT * FROM rec_session WHERE session_id = ?", (session_id,)
+        )
+        row = await cursor.fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        for key in ("candidate_ids", "shown_ids"):
+            if d.get(key):
+                try:
+                    d[key] = json.loads(d[key])
+                except (json.JSONDecodeError, TypeError):
+                    d[key] = []
+        return d
+
+    async def update_rec_session_shown(self, session_id: str, shown_ids: list[str]):
+        await self._conn.execute(
+            "UPDATE rec_session SET shown_ids = ? WHERE session_id = ?",
+            (json.dumps(shown_ids), session_id),
+        )
+        await self._conn.commit()

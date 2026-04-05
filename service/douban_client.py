@@ -2,35 +2,33 @@ import asyncio
 import random
 import re
 from typing import Optional
+from urllib.parse import quote_plus
 
 import httpx
 from bs4 import BeautifulSoup
 from astrbot.api import logger
 
-# 用户评分星级 → 数值的映射
-_RATING_CLASS_MAP = {
-    "rating1-t": 1.0,
-    "rating2-t": 2.0,
-    "rating3-t": 3.0,
-    "rating4-t": 4.0,
-    "rating5-t": 5.0,
-}
-
-_DEFAULT_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/125.0.0.0 Safari/537.36"
+_MOBILE_UA = (
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+    "Version/17.5 Mobile/15E148 Safari/604.1"
 )
 
-_BASE_HEADERS = {
-    "User-Agent": _DEFAULT_UA,
+_REXXAR_HEADERS = {
+    "User-Agent": _MOBILE_UA,
+    "Referer": "https://m.douban.com/",
+    "Accept": "application/json",
+}
+
+_SEARCH_HEADERS = {
+    "User-Agent": _MOBILE_UA,
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
 }
 
 
 class DoubanClient:
-    """豆瓣页面抓取与解析客户端。"""
+    """豆瓣 Rexxar API + 移动端搜索客户端。"""
 
     def __init__(
         self,
@@ -43,22 +41,78 @@ class DoubanClient:
         self._interval_max = interval_max
         self._max_retries = max_retries
         self._cookie = cookie
+        self.cookie_expired = False
 
     # ── 基础请求 ────────────────────────────────────────────
 
-    async def _request(
-        self, url: str, max_retries: int | None = None
-    ) -> Optional[str]:
-        retries = max_retries if max_retries is not None else self._max_retries
+    async def _request_json(
+        self, url: str, headers: dict | None = None
+    ) -> Optional[dict]:
+        """GET 请求返回 JSON，携带 Cookie。检测 Cookie 失效。"""
+        retries = self._max_retries
 
         for attempt in range(retries):
             try:
-                headers = {**_BASE_HEADERS}
+                req_headers = {**(headers or _REXXAR_HEADERS)}
                 if self._cookie:
-                    headers["Cookie"] = self._cookie
+                    req_headers["Cookie"] = self._cookie
 
                 async with httpx.AsyncClient(
-                    headers=headers, follow_redirects=True, timeout=15.0
+                    headers=req_headers, follow_redirects=False, timeout=15.0
+                ) as client:
+                    resp = await client.get(url)
+
+                    if resp.status_code in (301, 302):
+                        location = resp.headers.get("location", "")
+                        if "login" in location or "passport" in location:
+                            self.cookie_expired = True
+                            logger.warning("豆瓣 Cookie 已失效（重定向到登录页）")
+                            return None
+
+                    if resp.status_code == 401:
+                        self.cookie_expired = True
+                        logger.warning("豆瓣 Cookie 已失效（401）")
+                        return None
+
+                    if resp.status_code in (403, 429):
+                        wait = random.uniform(2, 5) * (attempt + 1)
+                        logger.warning(
+                            f"豆瓣反爬 {resp.status_code}，{wait:.1f}s 后重试 "
+                            f"({attempt + 1}/{retries})"
+                        )
+                        await asyncio.sleep(wait)
+                        continue
+
+                    if resp.status_code == 200:
+                        try:
+                            return resp.json()
+                        except Exception:
+                            logger.warning(f"响应非 JSON: {url}")
+                            return None
+
+                    logger.warning(f"请求 {url} 返回 {resp.status_code}")
+                    return None
+            except httpx.RequestError as exc:
+                logger.warning(f"请求 {url} 异常: {exc}")
+                if attempt < retries - 1:
+                    await asyncio.sleep(random.uniform(1, 3))
+
+        return None
+
+    async def _request_html(
+        self, url: str, headers: dict | None = None
+    ) -> Optional[str]:
+        """GET 请求返回 HTML 文本。"""
+        retries = self._max_retries
+
+        for attempt in range(retries):
+            try:
+                req_headers = {**(headers or _SEARCH_HEADERS)}
+                if self._cookie:
+                    req_headers["Cookie"] = self._cookie
+
+                async with httpx.AsyncClient(
+                    headers=req_headers, follow_redirects=True, timeout=15.0
                 ) as client:
                     resp = await client.get(url)
 
@@ -86,320 +140,180 @@ class DoubanClient:
     async def _delay(self):
         await asyncio.sleep(random.uniform(self._interval_min, self._interval_max))
 
-    # ── UID 验证 ─────────────────────────────────────────
-
-    async def validate_uid(self, douban_uid: str) -> Optional[dict]:
-        """验证豆瓣主页 ID 是否有效，返回 {uid, nickname}。"""
-        html = await self._request(f"https://www.douban.com/people/{douban_uid}/")
-        if not html:
-            return None
-
-        soup = BeautifulSoup(html, "html.parser")
-
-        # 提取昵称
-        nickname = ""
-        title_elem = soup.select_one("title")
-        if title_elem:
-            text = title_elem.get_text(strip=True)
-            # 页面标题通常是 "昵称的豆瓣主页" 或类似格式
-            nickname = re.sub(r"的豆瓣.*$", "", text).strip()
-
-        return {"uid": douban_uid, "nickname": nickname}
-
-    # ── 片单计数（快速估算） ─────────────────────────────────
-
-    async def fetch_collection_counts(self, uid: str) -> dict[str, int]:
-        """抓取各状态第一页，从分页器读取总数。返回 {wish: N, do: N, collect: N}。"""
-        import re
-
-        counts: dict[str, int] = {}
-        for status in ("wish", "do", "collect"):
-            url = (
-                f"https://movie.douban.com/people/{uid}/{status}"
-                f"?start=0&sort=time&rating=all&filter=all&mode=grid"
-            )
-            html = await self._request(url)
-            if not html:
-                counts[status] = 0
-                continue
-
-            soup = BeautifulSoup(html, "html.parser")
-            thispage = soup.select_one(".thispage")
-            total_pages = 1
-            if thispage:
-                tp = thispage.get("data-total-page")
-                if tp:
-                    total_pages = int(tp)
-
-            items = soup.select(".article .grid-view .item") or soup.select(".item")
-            first_page_count = len(items)
-            if total_pages <= 1:
-                counts[status] = first_page_count
-            else:
-                counts[status] = (total_pages - 1) * 15 + first_page_count
-
-        return counts
-
-    # ── 片单抓取 ────────────────────────────────────────────
-
-    async def fetch_collection_page(
-        self, uid: str, status: str, start: int = 0
-    ) -> tuple[list[dict], bool]:
-        """抓取一页片单，返回 (movies, has_more)。"""
-        url = (
-            f"https://movie.douban.com/people/{uid}/{status}"
-            f"?start={start}&sort=time&rating=all&filter=all&mode=grid"
-        )
-        html = await self._request(url)
-        if not html:
-            return [], False
-
-        soup = BeautifulSoup(html, "html.parser")
-        items = soup.select(".article .grid-view .item") or soup.select(".item")
-
-        movies = []
-        for item in items:
-            movie = self._parse_collection_item(item, status)
-            if movie:
-                movies.append(movie)
-
-        has_more = soup.select_one(".next") is not None
-        return movies, has_more
+    # ── 数字 ID 提取 ───────────────────────────────────────
 
     @staticmethod
-    def _parse_collection_item(item, status: str) -> Optional[dict]:
-        try:
-            link_elem = item.select_one("a[href*='/subject/']")
-            if not link_elem:
-                return None
+    def extract_numeric_id(raw_input: str) -> Optional[str]:
+        """从纯数字或豆瓣主页 URL 中提取数字 ID。
 
-            href = link_elem.get("href", "")
-            id_match = re.search(r"/subject/(\d+)/", href)
-            if not id_match:
-                return None
-
-            movie_id = id_match.group(1)
-
-            # 标题
-            title = link_elem.get("title", "") or link_elem.get_text(strip=True)
-            if not title:
-                t = item.select_one(".title a")
-                title = t.get_text(strip=True) if t else ""
-
-            # 用户评分
-            user_rating: float | None = None
-            for cls, val in _RATING_CLASS_MAP.items():
-                if item.select_one(f"[class*='{cls}']"):
-                    user_rating = val
-                    break
-
-            # 标记日期
-            date_elem = item.select_one(".date")
-            marked_at = date_elem.get_text(strip=True) if date_elem else None
-
-            # 用户标签
-            tags_elem = item.select_one(".tags")
-            tags = tags_elem.get_text(strip=True) if tags_elem else ""
-            tags = re.sub(r"^标签:\s*", "", tags)
-
-            return {
-                "douban_movie_id": movie_id,
-                "title": title,
-                "user_rating": user_rating,
-                "genres": tags,
-                "status": status,
-                "marked_at": marked_at,
-            }
-        except Exception as exc:
-            logger.warning(f"解析片单条目失败: {exc}")
+        支持格式：
+        - 纯数字：159896279
+        - 完整 URL：https://www.douban.com/people/159896279/
+        - 短格式：douban.com/people/159896279
+        """
+        raw_input = raw_input.strip()
+        if not raw_input:
             return None
 
-    async def fetch_all_collections(
-        self,
-        uid: str,
-        last_sync_time: Optional[str] = None,
-    ) -> dict[str, list[dict]]:
-        """抓取全部片单（想看/在看/看过），支持增量。"""
-        results: dict[str, list[dict]] = {"wish": [], "do": [], "collect": []}
+        # 纯数字
+        if raw_input.isdigit():
+            return raw_input
 
-        for status in ("wish", "do", "collect"):
-            start = 0
-            while True:
-                await self._delay()
-                movies, has_more = await self.fetch_collection_page(
-                    uid, status, start
-                )
-                if not movies:
-                    break
+        # 从 URL 提取
+        m = re.search(r"/people/(\d+)", raw_input)
+        if m:
+            return m.group(1)
 
-                if last_sync_time:
-                    new_movies = []
-                    for m in movies:
-                        if m.get("marked_at") and m["marked_at"] > last_sync_time:
-                            new_movies.append(m)
-                        else:
-                            has_more = False
-                            break
-                    movies = new_movies
+        return None
 
-                results[status].extend(movies)
+    # ── 用户验证 ─────────────────────────────────────────
 
-                if not has_more:
-                    break
-                start += 15  # grid 模式每页 15 条
+    async def validate_douban_uid(self, douban_uid: str) -> Optional[dict]:
+        """验证豆瓣数字 ID 是否有效。返回 {uid, nickname, total_marked}。"""
+        stats = await self.fetch_collection_stats(douban_uid)
+        if not stats:
+            return None
+
+        viewer = stats.get("viewer") or {}
+        nickname = viewer.get("name", "")
+
+        total_marked = 0
+        for year_data in stats.get("years", []):
+            total_marked += year_data.get("value", 0)
+
+        return {
+            "uid": douban_uid,
+            "nickname": nickname,
+            "total_marked": total_marked,
+        }
+
+    # ── 观影统计 API ──────────────────────────────────────
+
+    async def fetch_collection_stats(self, douban_uid: str) -> Optional[dict]:
+        """获取用户观影统计数据。
+
+        API: GET https://m.douban.com/rexxar/api/v2/user/{uid}/collection_stats
+        """
+        url = (
+            f"https://m.douban.com/rexxar/api/v2/user/{douban_uid}/collection_stats"
+        )
+        return await self._request_json(url)
+
+    # ── 电影搜索 ──────────────────────────────────────────
+
+    async def search_movies(
+        self, keyword: str, max_results: int = 40
+    ) -> list[dict]:
+        """搜索豆瓣电影，返回 [{id, title, rating, year, card_subtitle}]。
+
+        使用移动端搜索页面，解析 HTML。
+        """
+        encoded_kw = quote_plus(keyword)
+        url = f"https://m.douban.com/search/?query={encoded_kw}&type=movie"
+
+        await self._delay()
+        html = await self._request_html(url)
+        if not html:
+            return []
+
+        return self._parse_search_results(html, max_results)
+
+    @staticmethod
+    def _parse_search_results(html: str, max_results: int = 40) -> list[dict]:
+        """解析移动端搜索结果 HTML。"""
+        soup = BeautifulSoup(html, "html.parser")
+        results = []
+
+        # 移动端搜索结果通常在 .search-results 或 .result-list 中
+        items = soup.select(".search-results .result-item") or \
+                soup.select(".result-list .result") or \
+                soup.select(".subject-catalog .subject") or \
+                soup.select(".search-result")
+
+        if not items:
+            # 尝试更宽泛的选择器
+            items = soup.select("[data-id]")
+
+        for item in items[:max_results]:
+            try:
+                movie = DoubanClient._parse_search_item(item)
+                if movie:
+                    results.append(movie)
+            except Exception as exc:
+                logger.debug(f"解析搜索条目失败: {exc}")
 
         return results
 
-    # ── 电影详情 ────────────────────────────────────────────
-
-    async def fetch_movie_detail(self, movie_id: str) -> Optional[dict]:
-        """抓取电影详情页，提取类型/地区/年份。"""
-        await self._delay()
-        html = await self._request(f"https://movie.douban.com/subject/{movie_id}/")
-        if not html:
-            return None
-
-        soup = BeautifulSoup(html, "html.parser")
-        try:
-            title = ""
-            t = soup.select_one("span[property='v:itemreviewed']")
-            if t:
-                title = t.get_text(strip=True)
-
-            year: int | None = None
-            y = soup.select_one(".year")
-            if y:
-                m = re.search(r"(\d{4})", y.get_text())
-                if m:
-                    year = int(m.group(1))
-
-            avg_rating: float | None = None
-            r = soup.select_one("strong.rating_num") or soup.select_one(
-                "[property='v:average']"
-            )
-            if r:
-                try:
-                    avg_rating = float(r.get_text(strip=True))
-                except ValueError:
-                    pass
-
-            genres = [
-                g.get_text(strip=True) for g in soup.select("span[property='v:genre']")
-            ]
-
-            regions: list[str] = []
-            info = soup.select_one("#info")
-            if info:
-                rm = re.search(r"制片国家/地区:\s*(.+?)(?:\n|$)", info.get_text())
-                if rm:
-                    regions = [
-                        s.strip()
-                        for s in re.split(r"[/,，、]", rm.group(1).strip())
-                        if s.strip()
-                    ]
-
-            return {
-                "douban_movie_id": movie_id,
-                "title": title,
-                "year": year,
-                "avg_rating": avg_rating,
-                "genres": ",".join(genres),
-                "regions": ",".join(regions),
-            }
-        except Exception as exc:
-            logger.warning(f"解析电影详情 {movie_id} 失败: {exc}")
-            return None
-
-    # ── Top 250 ─────────────────────────────────────────────
-
-    async def fetch_top250(self) -> list[dict]:
-        """抓取豆瓣 Top 250 列表。"""
-        movies: list[dict] = []
-
-        for start in range(0, 250, 25):
-            await self._delay()
-            html = await self._request(
-                f"https://movie.douban.com/top250?start={start}&filter="
-            )
-            if not html:
-                break
-
-            soup = BeautifulSoup(html, "html.parser")
-            for item in soup.select("ol.grid_view > li"):
-                try:
-                    movie = self._parse_top250_item(item)
-                    if movie:
-                        movies.append(movie)
-                except Exception as exc:
-                    logger.warning(f"解析 Top250 条目失败: {exc}")
-
-        logger.info(f"已抓取 {len(movies)} 部 Top 250 影片")
-        return movies
-
     @staticmethod
-    def _parse_top250_item(item) -> Optional[dict]:
-        link = item.select_one("a[href*='/subject/']")
-        if not link:
-            return None
+    def _parse_search_item(item) -> Optional[dict]:
+        """解析单个搜索结果条目。"""
+        # 提取电影 ID
+        movie_id = None
 
-        href = link.get("href", "")
-        id_match = re.search(r"/subject/(\d+)/", href)
-        if not id_match:
+        # data-id 属性
+        movie_id = item.get("data-id", "")
+        if not movie_id:
+            # 从链接提取
+            link = item.select_one("a[href*='/subject/']")
+            if link:
+                href = link.get("href", "")
+                m = re.search(r"/subject/(\d+)", href)
+                if m:
+                    movie_id = m.group(1)
+
+        if not movie_id:
             return None
-        movie_id = id_match.group(1)
 
         # 标题
         title = ""
-        t = item.select_one(".title")
-        if t:
-            title = t.get_text(strip=True)
+        title_elem = item.select_one(".title") or item.select_one("h3") or item.select_one("a")
+        if title_elem:
+            title = title_elem.get_text(strip=True)
 
-        # 豆瓣评分
-        rating: float | None = None
-        r = item.select_one(".rating_num")
-        if r:
+        # 评分
+        rating = None
+        rating_elem = item.select_one(".rating_nums") or item.select_one("[class*='rating']")
+        if rating_elem:
             try:
-                rating = float(r.get_text(strip=True))
-            except ValueError:
+                rating = float(rating_elem.get_text(strip=True))
+            except (ValueError, TypeError):
                 pass
 
-        # 一句话评价
-        quote = ""
-        q = item.select_one(".inq")
-        if q:
-            quote = q.get_text(strip=True)
-
-        # 从简介行解析 年份 / 地区 / 类型
-        year: int | None = None
-        regions = ""
-        genres = ""
-
-        bd = item.select_one(".bd")
-        if bd:
-            p = bd.select_one("p")
-            if p:
-                text = p.get_text()
-                ym = re.search(r"(\d{4})", text)
-                if ym:
-                    year = int(ym.group(1))
-
-                lines = text.strip().split("\n")
-                if len(lines) >= 2:
-                    parts = [s.strip() for s in lines[-1].split("/")]
-                    if len(parts) >= 2:
-                        # 地区可能在中间多个部分（如 "美国 / 英国"）
-                        region_parts = parts[1:-1]
-                        regions = ",".join(r.strip() for r in region_parts if r.strip())
-                    if len(parts) >= 3:
-                        # genres 始终在最后一个部分
-                        genres = re.sub(r"\s+", ",", parts[-1].strip())
+        # 年份 / 信息行
+        year = None
+        card_subtitle = ""
+        info_elem = item.select_one(".subject-cast") or item.select_one(".meta") or item.select_one(".info")
+        if info_elem:
+            card_subtitle = info_elem.get_text(strip=True)
+            ym = re.search(r"(\d{4})", card_subtitle)
+            if ym:
+                year = int(ym.group(1))
 
         return {
-            "douban_movie_id": movie_id,
+            "id": str(movie_id),
             "title": title,
+            "rating": rating,
             "year": year,
-            "avg_rating": rating,
+            "card_subtitle": card_subtitle,
+        }
+
+    # ── 电影详情（Rexxar API） ────────────────────────────
+
+    async def fetch_movie_detail(self, movie_id: str) -> Optional[dict]:
+        """通过 Rexxar API 获取电影详情。"""
+        await self._delay()
+        url = f"https://m.douban.com/rexxar/api/v2/movie/{movie_id}"
+        data = await self._request_json(url)
+        if not data:
+            return None
+
+        genres = [g.get("name", "") for g in data.get("genres", []) if g.get("name")]
+
+        return {
+            "id": str(movie_id),
+            "title": data.get("title", ""),
+            "rating": data.get("rating", {}).get("value"),
+            "year": data.get("year"),
             "genres": genres,
-            "regions": regions,
-            "quote": quote,
+            "card_subtitle": data.get("card_subtitle", ""),
         }

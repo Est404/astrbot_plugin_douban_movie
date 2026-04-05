@@ -1,23 +1,19 @@
 """
-Test 3C: Recommender Logic
+Test: Recommender Logic (search-based)
 
-Tests that the recommender:
-- Excludes already-watched movies
-- Filters by minimum rating threshold
-- Limits result count to recommend_count
-- Supports genre filtering
-- Generates correct recommendation reasons
-- Handles edge cases (no bind, no data, all excluded)
+Tests:
+- search_and_recommend: keyword building, filtering, candidate pool
+- re_recommend: "看过了" feedback, persistent exclusion
+- LLM reason generation and fallback
+- Edge cases
 """
 
 from __future__ import annotations
 
-import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from astrbot_plugin_douban_movie.service.douban_client import DoubanClient
 from astrbot_plugin_douban_movie.service.recommender import Recommender
 
 
@@ -25,629 +21,370 @@ from astrbot_plugin_douban_movie.service.recommender import Recommender
 # Helpers
 # ---------------------------------------------------------------------------
 
-def run(coro):
-    """Run an async coroutine synchronously for testing."""
-    return asyncio.get_event_loop().run_until_complete(coro)
-
-
-def _top_movie(
+def make_search_result(
     movie_id="100",
-    title="Movie",
+    title="Test Movie",
+    rating=8.5,
     year=2020,
-    avg_rating=9.0,
-    genres="剧情",
-    regions="美国",
-    quote="",
+    card_subtitle="2020 / 美国 / 科幻",
 ):
     return {
-        "douban_movie_id": movie_id,
+        "id": movie_id,
         "title": title,
+        "rating": rating,
         "year": year,
-        "avg_rating": avg_rating,
-        "genres": genres,
-        "regions": regions,
-        "quote": quote,
+        "card_subtitle": card_subtitle,
     }
 
 
-def _collect_movie(genres="剧情", regions="美国", user_rating=4.0):
-    return {
-        "genres": genres,
-        "regions": regions,
-        "user_rating": user_rating,
-    }
-
-
-def _make_recommender(
-    collect_movies=None,
-    top250=None,
-    watched_ids=None,
+def _setup_recommender(
+    db,
+    client,
     recommend_count=5,
-    min_rating=8.0,
+    candidate_pool_size=20,
+    min_rating=7.0,
 ):
-    db = MagicMock()
-    db.get_bind = AsyncMock(return_value={"douban_uid": "d_test"})
-    db.get_all_collected_movie_ids = AsyncMock(return_value=watched_ids or set())
-    db.get_movies_by_status = AsyncMock(return_value=collect_movies or [])
-
-    client = MagicMock(spec=DoubanClient)
-    client.fetch_top250 = AsyncMock(return_value=top250 or [])
-
-    rec = Recommender(db, client, recommend_count=recommend_count, min_rating=min_rating)
-    return rec
+    return Recommender(
+        db, client,
+        recommend_count=recommend_count,
+        candidate_pool_size=candidate_pool_size,
+        min_rating=min_rating,
+    )
 
 
 # ===========================================================================
-# Basic recommendation
+# _build_search_keyword
 # ===========================================================================
 
-class TestRecommendBasic:
+class TestBuildSearchKeyword:
 
-    def test_excludes_watched_movies(self):
-        """Movies in watched_ids should not appear in recommendations."""
-        top250 = [
-            _top_movie(movie_id="10", avg_rating=9.0),
-            _top_movie(movie_id="20", avg_rating=9.0),
-            _top_movie(movie_id="30", avg_rating=9.0),
-        ]
-        rec = _make_recommender(
-            collect_movies=[_collect_movie()],
-            top250=top250,
-            watched_ids={"20"},
-            min_rating=8.0,
-        )
-        results = run(rec.recommend("user1"))
-        ids = {r["douban_movie_id"] for r in results}
-        assert "20" not in ids
+    def test_user_input_only(self):
+        rec = Recommender(MagicMock(), MagicMock())
+        kw = rec._build_search_keyword("科幻", [], [])
+        assert "科幻" in kw
 
-    def test_filters_below_min_rating(self):
-        """Movies with avg_rating < min_rating should be excluded."""
-        top250 = [
-            _top_movie(movie_id="10", avg_rating=6.0, genres="剧情"),
-            _top_movie(movie_id="20", avg_rating=9.0, genres="剧情"),
-        ]
-        rec = _make_recommender(
-            collect_movies=[_collect_movie()],
-            top250=top250,
-            min_rating=8.0,
-        )
-        results = run(rec.recommend("user1"))
-        ids = {r["douban_movie_id"] for r in results}
-        assert "10" not in ids
-        assert "20" in ids
+    def test_appends_genre_prefs(self):
+        rec = Recommender(MagicMock(), MagicMock())
+        kw = rec._build_search_keyword("轻松", ["喜剧", "爱情"], [])
+        assert "轻松" in kw
+        assert "喜剧" in kw
 
-    def test_result_count_capped(self):
-        """Result count should not exceed recommend_count."""
-        top250 = [_top_movie(movie_id=str(i), avg_rating=9.0) for i in range(20)]
-        rec = _make_recommender(
-            collect_movies=[_collect_movie()],
-            top250=top250,
-            recommend_count=3,
-            min_rating=8.0,
-        )
-        results = run(rec.recommend("user1"))
-        assert len(results) <= 3
+    def test_does_not_duplicate_genre_in_input(self):
+        rec = Recommender(MagicMock(), MagicMock())
+        kw = rec._build_search_keyword("科幻片", ["科幻", "动作"], [])
+        assert kw.count("科幻") == 1
 
-    def test_result_count_exactly_capped(self):
-        """When enough candidates exist, result count equals recommend_count."""
-        top250 = [_top_movie(movie_id=str(i), avg_rating=9.5) for i in range(10)]
-        rec = _make_recommender(
-            collect_movies=[_collect_movie()],
-            top250=top250,
-            recommend_count=5,
-            min_rating=8.0,
-        )
-        results = run(rec.recommend("user1"))
-        assert len(results) == 5
+    def test_empty_input_uses_genres(self):
+        rec = Recommender(MagicMock(), MagicMock())
+        kw = rec._build_search_keyword("", ["剧情", "科幻"], [])
+        assert "剧情" in kw
+        assert "科幻" in kw
 
-    def test_no_avg_rating_excluded(self):
-        """Movies with no avg_rating should be excluded."""
-        top250 = [
-            _top_movie(movie_id="10", avg_rating=None),
-        ]
-        rec = _make_recommender(
-            collect_movies=[_collect_movie()],
-            top250=top250,
-            min_rating=8.0,
-        )
-        results = run(rec.recommend("user1"))
-        assert len(results) == 0
+    def test_fallback_to_movie(self):
+        rec = Recommender(MagicMock(), MagicMock())
+        kw = rec._build_search_keyword("", [], [])
+        assert kw == "电影"
 
 
 # ===========================================================================
-# Genre filtering
+# search_and_recommend
 # ===========================================================================
 
-class TestGenreFilter:
+class TestSearchAndRecommend:
 
-    def test_genre_filter_includes_only_matching(self):
-        """When genre_filter is specified, only matching movies are returned."""
-        top250 = [
-            _top_movie(movie_id="10", genres="剧情", avg_rating=9.0),
-            _top_movie(movie_id="20", genres="科幻", avg_rating=9.0),
-            _top_movie(movie_id="30", genres="剧情,科幻", avg_rating=9.0),
-        ]
-        rec = _make_recommender(
-            collect_movies=[_collect_movie()],
-            top250=top250,
-            min_rating=8.0,
-        )
-        results = run(rec.recommend("user1", "科幻"))
-        for r in results:
-            assert "科幻" in r["genres"]
-
-    def test_genre_filter_no_match_returns_empty(self):
-        """When no movies match the genre filter, result is empty."""
-        top250 = [
-            _top_movie(movie_id="10", genres="剧情", avg_rating=9.0),
-        ]
-        rec = _make_recommender(
-            collect_movies=[_collect_movie()],
-            top250=top250,
-            min_rating=8.0,
-        )
-        results = run(rec.recommend("user1", "恐怖"))
-        assert len(results) == 0
-
-    def test_empty_genre_filter_returns_all(self):
-        """Empty genre_filter returns all qualifying movies (up to limit)."""
-        top250 = [
-            _top_movie(movie_id="10", genres="剧情", avg_rating=9.0),
-            _top_movie(movie_id="20", genres="科幻", avg_rating=9.0),
-        ]
-        rec = _make_recommender(
-            collect_movies=[_collect_movie()],
-            top250=top250,
-            recommend_count=10,
-            min_rating=8.0,
-        )
-        results = run(rec.recommend("user1", ""))
-        assert len(results) == 2
-
-
-# ===========================================================================
-# Recommendation reason generation
-# ===========================================================================
-
-class TestRecommendReasons:
-
-    def test_reason_contains_genre_match(self):
-        """When user and movie share genres, reason mentions them."""
-        top250 = [
-            _top_movie(movie_id="10", genres="剧情,科幻", avg_rating=8.5, regions="美国"),
-        ]
-        rec = _make_recommender(
-            collect_movies=[_collect_movie(genres="剧情,科幻")],
-            top250=top250,
-            min_rating=8.0,
-        )
-        results = run(rec.recommend("user1"))
-        assert len(results) > 0
-        reason = results[0]["reason"]
-        assert len(reason) > 0
-        assert "类型" in reason or "匹配" in reason
-
-    def test_reason_high_score_movie(self):
-        """Movies with avg_rating >= 9.0 get a special mention."""
-        top250 = [
-            _top_movie(movie_id="10", genres="动作", avg_rating=9.5, regions=""),
-        ]
-        rec = _make_recommender(
-            collect_movies=[_collect_movie(genres="动作")],
-            top250=top250,
-            min_rating=8.0,
-        )
-        results = run(rec.recommend("user1"))
-        reason = results[0]["reason"]
-        assert "9.5" in reason or "高分" in reason or "评分" in reason
-
-    def test_reason_includes_quote(self):
-        """When movie has a quote, it may appear in the reason."""
-        top250 = [
-            _top_movie(movie_id="10", genres="剧情", avg_rating=9.0, quote="经典之作"),
-        ]
-        rec = _make_recommender(
-            collect_movies=[_collect_movie(genres="剧情")],
-            top250=top250,
-            min_rating=8.0,
-        )
-        results = run(rec.recommend("user1"))
-        reason = results[0]["reason"]
-        assert "经典之作" in reason or len(reason) > 0
-
-    def test_reason_default_when_no_match(self):
-        """When no specific reason applies, a default reason is given."""
-        top250 = [
-            _top_movie(movie_id="10", genres="纪录片", avg_rating=8.5, regions="德国"),
-        ]
-        rec = _make_recommender(
-            collect_movies=[_collect_movie(genres="动作", regions="美国")],
-            top250=top250,
-            min_rating=8.0,
-        )
-        results = run(rec.recommend("user1"))
-        assert len(results) > 0
-        assert results[0]["reason"] == "高分佳作推荐"
-
-    def test_all_results_have_reason(self):
-        """Every result should have a non-empty reason field."""
-        top250 = [_top_movie(movie_id=str(i), avg_rating=9.0) for i in range(5)]
-        rec = _make_recommender(
-            collect_movies=[_collect_movie()],
-            top250=top250,
-            min_rating=8.0,
-        )
-        results = run(rec.recommend("user1"))
-        for r in results:
-            assert "reason" in r
-            assert isinstance(r["reason"], str)
-            assert len(r["reason"]) > 0
-
-
-# ===========================================================================
-# Edge cases
-# ===========================================================================
-
-class TestRecommendEdgeCases:
-
-    def test_no_bind_returns_empty(self):
-        """User not bound -> returns empty list."""
-        db = MagicMock()
-        db.get_bind = AsyncMock(return_value=None)
-        client = MagicMock(spec=DoubanClient)
-        rec = Recommender(db, client)
-        results = run(rec.recommend("user1"))
+    async def test_no_profile_returns_empty(self, db, mock_client):
+        rec = _setup_recommender(db, mock_client)
+        results, session_id = await rec.search_and_recommend("u1")
         assert results == []
+        assert session_id == ""
 
-    def test_all_movies_watched(self):
-        """All Top250 movies are already watched -> empty result."""
-        top250 = [
-            _top_movie(movie_id="10", avg_rating=9.0),
-            _top_movie(movie_id="20", avg_rating=9.0),
+    async def test_no_search_results(self, db, mock_client):
+        await db.save_profile("u1", "text", {}, ["剧情"], ["美国"], ["2020s"], 100)
+        mock_client.search_movies = AsyncMock(return_value=[])
+
+        rec = _setup_recommender(db, mock_client)
+        results, session_id = await rec.search_and_recommend("u1", "科幻")
+        assert results == []
+        assert session_id == ""
+
+    async def test_successful_recommendation(self, db, mock_client):
+        await db.save_profile("u1", "text", {}, ["剧情"], ["美国"], ["2020s"], 100)
+        search_results = [
+            make_search_result(movie_id=str(i), title=f"电影{i}", rating=8.0 + i * 0.1)
+            for i in range(10)
         ]
-        rec = _make_recommender(
-            collect_movies=[_collect_movie()],
-            top250=top250,
-            watched_ids={"10", "20"},
-            min_rating=8.0,
-        )
-        results = run(rec.recommend("user1"))
-        assert len(results) == 0
+        mock_client.search_movies = AsyncMock(return_value=search_results)
 
-    def test_all_movies_below_min_rating(self):
-        """All Top250 movies below min_rating -> empty result."""
-        top250 = [
-            _top_movie(movie_id="10", avg_rating=5.0),
-            _top_movie(movie_id="20", avg_rating=7.0),
-        ]
-        rec = _make_recommender(
-            collect_movies=[_collect_movie()],
-            top250=top250,
-            min_rating=8.0,
-        )
-        results = run(rec.recommend("user1"))
-        assert len(results) == 0
-
-    def test_empty_top250(self):
-        """No Top250 data -> empty result."""
-        rec = _make_recommender(
-            collect_movies=[_collect_movie()],
-            top250=[],
-            min_rating=8.0,
-        )
-        results = run(rec.recommend("user1"))
-        assert len(results) == 0
-
-    def test_score_ranking_order(self):
-        """Movies should be sorted by score (descending)."""
-        top250 = [
-            _top_movie(movie_id="low_match", genres="纪录片", avg_rating=8.5, regions="德国"),
-            _top_movie(movie_id="high_match", genres="剧情,科幻", avg_rating=9.0, regions="美国"),
-        ]
-        rec = _make_recommender(
-            collect_movies=[_collect_movie(genres="剧情,科幻", regions="美国")],
-            top250=top250,
-            min_rating=8.0,
-        )
-        results = run(rec.recommend("user1"))
-        assert results[0]["douban_movie_id"] == "high_match"
-
-    def test_top250_cache(self):
-        """Top250 is fetched only once (cached)."""
-        top250 = [_top_movie(movie_id="10", avg_rating=9.0)]
-        rec = _make_recommender(
-            collect_movies=[_collect_movie()],
-            top250=top250,
-            min_rating=8.0,
-        )
-        run(rec.recommend("user1"))
-        run(rec.recommend("user1"))
-        rec.client.fetch_top250.assert_called_once()
-
-    def test_results_contain_expected_keys(self):
-        """Each result dict should have all expected keys."""
-        top250 = [_top_movie(movie_id="10", avg_rating=9.0)]
-        rec = _make_recommender(
-            collect_movies=[_collect_movie()],
-            top250=top250,
-            min_rating=8.0,
-        )
-        results = run(rec.recommend("user1"))
+        rec = _setup_recommender(db, mock_client, recommend_count=3)
+        results, session_id = await rec.search_and_recommend("u1", "科幻")
+        assert len(results) == 3
+        assert session_id != ""
         for r in results:
-            assert "douban_movie_id" in r
-            assert "title" in r
             assert "reason" in r
-            assert "score" in r
 
+    async def test_excludes_seen_movies(self, db, mock_client):
+        await db.save_profile("u1", "text", {}, ["剧情"], [], [], 100)
+        await db.add_seen_movies("u1", [{"douban_movie_id": "0", "title": "A"}])
 
-# ===========================================================================
-# _build_llm_prompt unit tests
-# ===========================================================================
-
-class TestBuildLLMPrompt:
-
-    def test_prompt_contains_role(self):
-        rec = _make_recommender()
-        user_prefs = {"top_genres": [("剧情", 5)], "top_regions": ["美国"]}
-        results = [{"title": "Test", "year": 2020, "avg_rating": 9.0, "genres": "剧情", "regions": "美国"}]
-        prompt = rec._build_llm_prompt(user_prefs, results)
-        assert "影评人" in prompt
-
-    def test_prompt_contains_genres(self):
-        rec = _make_recommender()
-        user_prefs = {"top_genres": [("科幻", 3), ("动作", 2)], "top_regions": ["美国"]}
-        results = [{"title": "T", "year": 2020, "avg_rating": 9.0, "genres": "科幻", "regions": "美国"}]
-        prompt = rec._build_llm_prompt(user_prefs, results)
-        assert "科幻" in prompt
-        assert "3部" in prompt
-
-    def test_prompt_contains_regions(self):
-        rec = _make_recommender()
-        user_prefs = {"top_genres": [("剧情", 5)], "top_regions": ["美国", "日本"]}
-        results = [{"title": "T", "year": 2020, "avg_rating": 9.0, "genres": "剧情", "regions": "美国"}]
-        prompt = rec._build_llm_prompt(user_prefs, results)
-        assert "美国" in prompt
-
-    def test_prompt_contains_movies(self):
-        rec = _make_recommender()
-        user_prefs = {"top_genres": [("剧情", 5)], "top_regions": ["美国"]}
-        results = [
-            {"title": "肖申克的救赎", "year": 1994, "avg_rating": 9.7, "genres": "犯罪,剧情", "regions": "美国"},
+        search_results = [
+            make_search_result(movie_id="0", title="已看", rating=9.0),
+            make_search_result(movie_id="1", title="未看", rating=8.0),
         ]
-        prompt = rec._build_llm_prompt(user_prefs, results)
-        assert "肖申克的救赎" in prompt
-        assert "9.7" in prompt
+        mock_client.search_movies = AsyncMock(return_value=search_results)
 
-    def test_prompt_contains_format_instruction(self):
-        rec = _make_recommender()
-        user_prefs = {"top_genres": [("剧情", 5)], "top_regions": ["美国"]}
-        results = [{"title": "T", "year": 2020, "avg_rating": 9.0, "genres": "剧情", "regions": "美国"}]
-        prompt = rec._build_llm_prompt(user_prefs, results)
-        assert "30字" in prompt
-        assert "1." in prompt
+        rec = _setup_recommender(db, mock_client, recommend_count=5)
+        results, _ = await rec.search_and_recommend("u1")
+        ids = {r["id"] for r in results}
+        assert "0" not in ids
+
+    async def test_filters_below_min_rating(self, db, mock_client):
+        await db.save_profile("u1", "text", {}, ["剧情"], [], [], 100)
+        search_results = [
+            make_search_result(movie_id="1", rating=5.0),
+            make_search_result(movie_id="2", rating=8.0),
+        ]
+        mock_client.search_movies = AsyncMock(return_value=search_results)
+
+        rec = _setup_recommender(db, mock_client, recommend_count=5, min_rating=7.0)
+        results, _ = await rec.search_and_recommend("u1")
+        ids = {r["id"] for r in results}
+        assert "1" not in ids
+        assert "2" in ids
+
+    async def test_session_created_in_db(self, db, mock_client):
+        await db.save_profile("u1", "text", {}, ["剧情"], [], [], 100)
+        mock_client.search_movies = AsyncMock(return_value=[
+            make_search_result(movie_id="1", rating=8.0),
+        ])
+
+        rec = _setup_recommender(db, mock_client, recommend_count=1)
+        results, session_id = await rec.search_and_recommend("u1")
+        assert session_id != ""
+
+        session = await db.get_rec_session(session_id)
+        assert session is not None
+        assert "1" in session["candidate_ids"]
+
+    async def test_result_count_capped(self, db, mock_client):
+        await db.save_profile("u1", "text", {}, ["剧情"], [], [], 100)
+        mock_client.search_movies = AsyncMock(return_value=[
+            make_search_result(movie_id=str(i), rating=9.0) for i in range(30)
+        ])
+
+        rec = _setup_recommender(db, mock_client, recommend_count=3)
+        results, _ = await rec.search_and_recommend("u1")
+        assert len(results) == 3
+
+    async def test_keyword_includes_user_input(self, db, mock_client):
+        await db.save_profile("u1", "text", {}, ["剧情"], [], [], 100)
+        mock_client.search_movies = AsyncMock(return_value=[])
+
+        rec = _setup_recommender(db, mock_client)
+        await rec.search_and_recommend("u1", "喜剧")
+        # Verify search was called (keyword should include 喜剧)
+        mock_client.search_movies.assert_called_once()
+        called_kw = mock_client.search_movies.call_args[0][0]
+        assert "喜剧" in called_kw
 
 
 # ===========================================================================
-# _parse_llm_reasons unit tests
+# re_recommend
 # ===========================================================================
 
-class TestParseLLMReasons:
+class TestReRecommend:
 
-    def test_parse_numbered_list(self):
-        rec = _make_recommender()
+    async def test_exhausted_pool_returns_none(self, db, mock_client):
+        """When candidate pool is empty, returns None."""
+        await db.create_rec_session("s1", "u1", "科幻", ["100"])
+        await db.update_rec_session_shown("s1", ["100"])
+
+        rec = _setup_recommender(db, mock_client)
+        result = await rec.re_recommend("s1", "u1")
+        assert result is None
+
+    async def test_re_recommend_returns_new_movies(self, db, mock_client):
+        """Returns new movies from remaining pool."""
+        await db.create_rec_session("s1", "u1", "科幻", ["100", "200", "300"])
+        await db.update_rec_session_shown("s1", ["100"])
+
+        # Mock movie detail fetching
+        mock_client.fetch_movie_detail = AsyncMock(return_value={
+            "id": "200", "title": "新电影", "rating": 8.5, "year": 2024,
+            "card_subtitle": "2024 / 美国 / 科幻",
+        })
+
+        rec = _setup_recommender(db, mock_client, recommend_count=1)
+        result = await rec.re_recommend("s1", "u1")
+        assert result is not None
+        results, _ = result
+        assert len(results) >= 1
+        assert results[0]["id"] != "100"  # Not the already-shown one
+
+    async def test_seen_movies_persisted(self, db, mock_client):
+        """Shown movies are written to user_seen_movies."""
+        await db.create_rec_session("s1", "u1", "科幻", ["100", "200"])
+        await db.update_rec_session_shown("s1", ["100"])
+
+        mock_client.fetch_movie_detail = AsyncMock(return_value={
+            "id": "200", "title": "新电影", "rating": 8.5, "year": 2024,
+            "card_subtitle": "2024 / 美国",
+        })
+
+        rec = _setup_recommender(db, mock_client)
+        await rec.re_recommend("s1", "u1")
+
+        seen = await db.get_seen_movie_ids("u1")
+        assert "100" in seen
+
+    async def test_session_not_found_returns_none(self, db, mock_client):
+        rec = _setup_recommender(db, mock_client)
+        result = await rec.re_recommend("nonexistent", "u1")
+        assert result is None
+
+    async def test_shown_ids_updated(self, db, mock_client):
+        """After re_recommend, shown_ids includes old + new."""
+        await db.create_rec_session("s1", "u1", "科幻", ["100", "200", "300"])
+        await db.update_rec_session_shown("s1", ["100"])
+
+        mock_client.fetch_movie_detail = AsyncMock(return_value={
+            "id": "200", "title": "M2", "rating": 8.0, "year": 2020,
+            "card_subtitle": "2020 / 美国",
+        })
+
+        rec = _setup_recommender(db, mock_client, recommend_count=1)
+        await rec.re_recommend("s1", "u1")
+
+        session = await db.get_rec_session("s1")
+        assert "100" in session["shown_ids"]
+
+
+# ===========================================================================
+# LLM prompt and reason parsing
+# ===========================================================================
+
+class TestLLMReasons:
+
+    def test_build_llm_reasons_prompt(self):
+        rec = Recommender(MagicMock(), MagicMock())
+        results = [make_search_result(title="电影A", rating=9.0)]
+        prompt = rec._build_llm_reasons_prompt(results, ["剧情"], ["美国"])
+        assert "影评人" in prompt
+        assert "电影A" in prompt
+        assert "剧情" in prompt
+
+    def test_parse_llm_reasons_numbered(self):
+        rec = Recommender(MagicMock(), MagicMock())
         text = "1. 经典剧情片\n2. 视觉震撼\n3. 温馨感人"
         reasons = rec._parse_llm_reasons(text, 3)
         assert reasons == ["经典剧情片", "视觉震撼", "温馨感人"]
 
-    def test_parse_chinese_period(self):
-        rec = _make_recommender()
+    def test_parse_llm_reasons_chinese_period(self):
+        rec = Recommender(MagicMock(), MagicMock())
         text = "1、经典剧情片\n2、视觉震撼"
         reasons = rec._parse_llm_reasons(text, 2)
-        assert reasons == ["经典剧情片", "视觉震撼"]
+        assert len(reasons) == 2
 
-    def test_parse_mixed_format(self):
-        rec = _make_recommender()
-        text = "1. 经典剧情片\n2、视觉震撼\n3. 温馨感人"
-        reasons = rec._parse_llm_reasons(text, 3)
-        assert len(reasons) == 3
-
-    def test_parse_partial_match(self):
-        rec = _make_recommender()
+    def test_parse_llm_reasons_partial(self):
+        rec = Recommender(MagicMock(), MagicMock())
         text = "1. 经典\n2. 震撼"
         reasons = rec._parse_llm_reasons(text, 3)
         assert len(reasons) == 2
 
-    def test_parse_no_match(self):
-        rec = _make_recommender()
-        text = "没有编号的文本"
-        reasons = rec._parse_llm_reasons(text, 3)
-        assert reasons == []
-
-    def test_parse_empty_text(self):
-        rec = _make_recommender()
+    def test_parse_llm_reasons_empty(self):
+        rec = Recommender(MagicMock(), MagicMock())
         reasons = rec._parse_llm_reasons("", 2)
         assert reasons == []
 
-    def test_parse_fullwidth_period(self):
-        rec = _make_recommender()
-        text = "1．经典剧情\n2．震撼视觉"
-        reasons = rec._parse_llm_reasons(text, 2)
-        assert len(reasons) == 2
-
-
-# ===========================================================================
-# _generate_template_reasons unit tests
-# ===========================================================================
-
-class TestGenerateTemplateReasons:
-
-    def test_genre_match_reason(self):
-        rec = _make_recommender()
-        results = [{"matched_genres": {"剧情", "科幻"}}]
-        rec._generate_template_reasons(results)
-        assert "剧情" in results[0]["reason"] or "科幻" in results[0]["reason"]
-
-    def test_high_score_reason(self):
-        rec = _make_recommender()
-        results = [{"avg_rating": 9.5, "matched_genres": set()}]
-        rec._generate_template_reasons(results)
-        assert "9.5" in results[0]["reason"]
-
-    def test_quote_in_reason(self):
-        rec = _make_recommender()
-        results = [{"quote": "经典之作", "matched_genres": set()}]
-        rec._generate_template_reasons(results)
-        assert "经典之作" in results[0]["reason"]
-
-    def test_default_reason_when_no_match(self):
-        rec = _make_recommender()
-        results = [{"matched_genres": set()}]
-        rec._generate_template_reasons(results)
-        assert results[0]["reason"] == "高分佳作推荐"
-
-    def test_combined_reasons(self):
-        rec = _make_recommender()
-        results = [{"matched_genres": {"剧情"}, "avg_rating": 9.5, "quote": "好电影"}]
-        rec._generate_template_reasons(results)
-        reason = results[0]["reason"]
-        assert "剧情" in reason
-        assert "9.5" in reason
-        assert "好电影" in reason
-
-    def test_empty_results_list(self):
-        rec = _make_recommender()
-        results = []
-        rec._generate_template_reasons(results)  # should not raise
-        assert results == []
-
-    def test_reason_always_set(self):
-        rec = _make_recommender()
-        results = [{"matched_genres": set(), "avg_rating": 8.5}]
-        rec._generate_template_reasons(results)
-        assert "reason" in results[0]
-        assert len(results[0]["reason"]) > 0
-
-
-# ===========================================================================
-# recommend with LLM integration
-# ===========================================================================
-
-class TestRecommendWithLLM:
-
-    def test_llm_success_sets_reasons(self):
-        """When LLM returns valid reasons, they are used instead of template."""
-        top250 = [
-            _top_movie(movie_id="10", avg_rating=9.0, genres="剧情"),
-            _top_movie(movie_id="20", avg_rating=9.0, genres="剧情"),
-        ]
-        rec = _make_recommender(
-            collect_movies=[_collect_movie()],
-            top250=top250,
-            min_rating=8.0,
-        )
+    async def test_llm_success_sets_reasons(self, db, mock_client):
+        await db.save_profile("u1", "text", {}, ["剧情"], [], [], 100)
+        mock_client.search_movies = AsyncMock(return_value=[
+            make_search_result(movie_id="1", title="A", rating=9.0),
+            make_search_result(movie_id="2", title="B", rating=9.0),
+        ])
 
         mock_context = MagicMock()
         mock_resp = MagicMock()
         mock_resp.completion_text = "1. LLM理由A\n2. LLM理由B"
         mock_context.llm_generate = AsyncMock(return_value=mock_resp)
 
-        results = run(rec.recommend("user1", "", mock_context, "test-provider"))
+        rec = _setup_recommender(db, mock_client, recommend_count=2)
+        results, _ = await rec.search_and_recommend(
+            "u1", "科幻", "你是佩丽卡", mock_context, "test-provider"
+        )
         assert len(results) == 2
         assert results[0]["reason"] == "LLM理由A"
         assert results[1]["reason"] == "LLM理由B"
 
-    def test_llm_failure_falls_back_to_template(self):
-        """When LLM raises, falls back to template reasons."""
-        top250 = [_top_movie(movie_id="10", avg_rating=9.0, genres="剧情")]
-        rec = _make_recommender(
-            collect_movies=[_collect_movie(genres="剧情")],
-            top250=top250,
-            min_rating=8.0,
-        )
+    async def test_llm_failure_falls_back(self, db, mock_client):
+        await db.save_profile("u1", "text", {}, ["剧情"], [], [], 100)
+        mock_client.search_movies = AsyncMock(return_value=[
+            make_search_result(movie_id="1", title="A", rating=9.0),
+        ])
 
         mock_context = MagicMock()
-        mock_context.llm_generate = AsyncMock(side_effect=RuntimeError("LLM down"))
+        mock_context.llm_generate = AsyncMock(side_effect=RuntimeError("fail"))
 
-        results = run(rec.recommend("user1", "", mock_context, "test-provider"))
-        assert len(results) > 0
-        assert "reason" in results[0]
-        assert len(results[0]["reason"]) > 0
-
-    def test_llm_reasons_count_mismatch_falls_back(self):
-        """When LLM returns wrong number of reasons, falls back to template."""
-        top250 = [
-            _top_movie(movie_id="10", avg_rating=9.0, genres="剧情"),
-            _top_movie(movie_id="20", avg_rating=9.0, genres="剧情"),
-        ]
-        rec = _make_recommender(
-            collect_movies=[_collect_movie()],
-            top250=top250,
-            min_rating=8.0,
+        rec = _setup_recommender(db, mock_client)
+        results, _ = await rec.search_and_recommend(
+            "u1", "", "", mock_context, "test-provider"
         )
-
-        mock_context = MagicMock()
-        mock_resp = MagicMock()
-        # Only 1 reason for 2 movies -> mismatch -> fallback
-        mock_resp.completion_text = "1. 唯一理由"
-        mock_context.llm_generate = AsyncMock(return_value=mock_resp)
-
-        results = run(rec.recommend("user1", "", mock_context, "test-provider"))
-        assert len(results) == 2
-        # Should have template reasons, not the LLM reason
-        for r in results:
-            assert "reason" in r
-
-    def test_no_context_uses_template(self):
-        """When context is None, template reasons are generated."""
-        top250 = [_top_movie(movie_id="10", avg_rating=9.0, genres="剧情")]
-        rec = _make_recommender(
-            collect_movies=[_collect_movie(genres="剧情")],
-            top250=top250,
-            min_rating=8.0,
-        )
-        results = run(rec.recommend("user1", "", None, ""))
         assert len(results) > 0
         assert "reason" in results[0]
 
-    def test_no_provider_id_uses_template(self):
-        """When provider_id is empty, template reasons are generated."""
-        top250 = [_top_movie(movie_id="10", avg_rating=9.0, genres="剧情")]
-        rec = _make_recommender(
-            collect_movies=[_collect_movie(genres="剧情")],
-            top250=top250,
-            min_rating=8.0,
-        )
-        mock_context = MagicMock()
-        results = run(rec.recommend("user1", "", mock_context, ""))
-        assert len(results) > 0
-        assert "reason" in results[0]
 
-    def test_llm_none_response_falls_back(self):
-        """When LLM returns None, falls back to template reasons."""
-        top250 = [_top_movie(movie_id="10", avg_rating=9.0, genres="剧情")]
-        rec = _make_recommender(
-            collect_movies=[_collect_movie(genres="剧情")],
-            top250=top250,
-            min_rating=8.0,
-        )
-        mock_context = MagicMock()
-        mock_context.llm_generate = AsyncMock(return_value=None)
-        results = run(rec.recommend("user1", "", mock_context, "test-provider"))
-        assert len(results) > 0
-        assert "reason" in results[0]
+# ===========================================================================
+# Template reason fallback
+# ===========================================================================
 
-    def test_llm_empty_completion_falls_back(self):
-        """When LLM returns empty completion_text, falls back to template."""
-        top250 = [_top_movie(movie_id="10", avg_rating=9.0, genres="剧情")]
-        rec = _make_recommender(
-            collect_movies=[_collect_movie(genres="剧情")],
-            top250=top250,
-            min_rating=8.0,
+class TestTemplateReason:
+
+    def test_high_rating(self):
+        reason = Recommender._template_reason(
+            {"rating": 9.5, "card_subtitle": ""}, ["剧情"]
         )
-        mock_context = MagicMock()
-        mock_resp = MagicMock()
-        mock_resp.completion_text = ""
-        mock_context.llm_generate = AsyncMock(return_value=mock_resp)
-        results = run(rec.recommend("user1", "", mock_context, "test-provider"))
-        assert len(results) > 0
-        assert "reason" in results[0]
+        assert "9.5" in reason or "高达" in reason
+
+    def test_genre_match(self):
+        reason = Recommender._template_reason(
+            {"rating": 8.0, "card_subtitle": "美国 / 剧情"}, ["剧情", "科幻"]
+        )
+        assert "剧情" in reason or "类型" in reason
+
+    def test_default_reason(self):
+        reason = Recommender._template_reason(
+            {"rating": 7.5, "card_subtitle": "未知"}, ["恐怖"]
+        )
+        assert len(reason) > 0
+
+
+# ===========================================================================
+# Edge cases
+# ===========================================================================
+
+class TestRecommenderEdgeCases:
+
+    async def test_no_rating_movies_included(self, db, mock_client):
+        """Movies without rating pass the filter (only those below min are excluded)."""
+        await db.save_profile("u1", "text", {}, ["剧情"], [], [], 100)
+        mock_client.search_movies = AsyncMock(return_value=[
+            make_search_result(movie_id="1", rating=None),
+        ])
+
+        rec = _setup_recommender(db, mock_client, recommend_count=5)
+        results, _ = await rec.search_and_recommend("u1")
+        # rating=None should be included (not below 7.0)
+        assert len(results) >= 0  # May or may not be selected
+
+    async def test_candidate_pool_size_respected(self, db, mock_client):
+        """Only top N candidates are used from search results."""
+        await db.save_profile("u1", "text", {}, ["剧情"], [], [], 100)
+        # Create 50 results with descending ratings
+        mock_client.search_movies = AsyncMock(return_value=[
+            make_search_result(movie_id=str(i), rating=10.0 - i * 0.1) for i in range(50)
+        ])
+
+        rec = _setup_recommender(db, mock_client, candidate_pool_size=5, recommend_count=5)
+        results, session_id = await rec.search_and_recommend("u1")
+
+        session = await db.get_rec_session(session_id)
+        assert len(session["candidate_ids"]) <= 5

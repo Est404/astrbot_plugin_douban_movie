@@ -10,7 +10,6 @@ Verifies that:
 from __future__ import annotations
 
 import ast
-import json
 import py_compile
 import sys
 import tempfile
@@ -44,7 +43,6 @@ def plugin_dir():
 def test_py_compile_valid(plugin_dir, rel_path):
     """Each .py file compiles without SyntaxError via py_compile."""
     full_path = plugin_dir / rel_path
-    # py_compile.compile returns the path on success, raises SyntaxError on failure
     result = py_compile.compile(str(full_path), doraise=True)
     assert result is not None
 
@@ -68,27 +66,26 @@ def test_import_db_database():
     assert Database is not None
     assert hasattr(Database, "init")
     assert hasattr(Database, "bind_user")
-    # bind_user should accept exactly 2 args (astrbot_uid, douban_uid) -- no cookie
-    import inspect
-    sig = inspect.signature(Database.bind_user)
-    params = list(sig.parameters.keys())
-    assert params == ["self", "astrbot_uid", "douban_uid"], (
-        f"bind_user signature changed: {params}"
-    )
+    assert hasattr(Database, "save_profile")
+    assert hasattr(Database, "get_profile")
+    assert hasattr(Database, "add_seen_movies")
+    assert hasattr(Database, "get_seen_movie_ids")
+    assert hasattr(Database, "create_rec_session")
+    assert hasattr(Database, "get_rec_session")
+    assert hasattr(Database, "update_rec_session_shown")
+    assert hasattr(Database, "update_last_profile")
 
 
 def test_import_service_douban_client():
     """from .service.douban_client import DoubanClient works."""
     from astrbot_plugin_douban_movie.service.douban_client import DoubanClient
     assert DoubanClient is not None
-    assert hasattr(DoubanClient, "fetch_top250")
-    assert hasattr(DoubanClient, "_parse_collection_item")
-    assert hasattr(DoubanClient, "validate_uid")
-    # _request should not have cookie parameter
-    import inspect
-    sig = inspect.signature(DoubanClient._request)
-    params = list(sig.parameters.keys())
-    assert "cookie" not in params, f"_request still has cookie param: {params}"
+    assert hasattr(DoubanClient, "extract_numeric_id")
+    assert hasattr(DoubanClient, "fetch_collection_stats")
+    assert hasattr(DoubanClient, "search_movies")
+    assert hasattr(DoubanClient, "validate_douban_uid")
+    assert hasattr(DoubanClient, "_request_json")
+    assert hasattr(DoubanClient, "_request_html")
 
 
 def test_import_service_profile():
@@ -96,8 +93,8 @@ def test_import_service_profile():
     from astrbot_plugin_douban_movie.service.profile import ProfileGenerator
     assert ProfileGenerator is not None
     assert hasattr(ProfileGenerator, "generate")
-    assert hasattr(ProfileGenerator, "_collect_stats")
-    assert hasattr(ProfileGenerator, "_format_stats_text")
+    assert hasattr(ProfileGenerator, "_extract_prefs_from_stats")
+    assert hasattr(ProfileGenerator, "_format_profile_from_stats")
     assert hasattr(ProfileGenerator, "_build_llm_prompt")
 
 
@@ -105,31 +102,36 @@ def test_import_service_recommender():
     """from .service.recommender import Recommender works."""
     from astrbot_plugin_douban_movie.service.recommender import Recommender
     assert Recommender is not None
-    assert hasattr(Recommender, "recommend")
-    assert hasattr(Recommender, "_build_llm_prompt")
+    assert hasattr(Recommender, "search_and_recommend")
+    assert hasattr(Recommender, "re_recommend")
+    assert hasattr(Recommender, "_build_llm_reasons_prompt")
     assert hasattr(Recommender, "_parse_llm_reasons")
-    assert hasattr(Recommender, "_generate_template_reasons")
 
 
 def test_relative_import_chain():
-    """ProfileGenerator uses from ..db.database import Database -- verify this chain."""
+    """ProfileGenerator accepts db + client in constructor."""
     from astrbot_plugin_douban_movie.service.profile import ProfileGenerator
     from astrbot_plugin_douban_movie.db.database import Database
-    # ProfileGenerator accepts a Database instance
+    from astrbot_plugin_douban_movie.service.douban_client import DoubanClient
+
     mock_db = MagicMock(spec=Database)
-    gen = ProfileGenerator(mock_db)
+    mock_client = MagicMock(spec=DoubanClient)
+    gen = ProfileGenerator(mock_db, mock_client)
     assert gen.db is mock_db
+    assert gen.client is mock_client
 
 
 def test_recommender_relative_import_chain():
-    """Recommender uses from ..db.database and from ..service.douban_client."""
+    """Recommender accepts db + client in constructor."""
     from astrbot_plugin_douban_movie.service.recommender import Recommender
     from astrbot_plugin_douban_movie.db.database import Database
     from astrbot_plugin_douban_movie.service.douban_client import DoubanClient
+
     mock_db = MagicMock(spec=Database)
     mock_client = MagicMock(spec=DoubanClient)
     rec = Recommender(mock_db, mock_client)
     assert rec.db is mock_db
+    assert rec.client is mock_client
 
 
 # ---------------------------------------------------------------------------
@@ -150,13 +152,13 @@ def test_doubanmovie_init_success():
             with patch.object(Database, "init", new_callable=AsyncMock):
                 ctx = MagicMock()
                 config = {
-                    "sync_timeout": 60,
+                    "douban_cookie": "",
                     "recommend_count": 5,
-                    "min_rating": 8.0,
+                    "candidate_pool_size": 20,
+                    "min_rating": 7.0,
                     "request_interval_min": 1.0,
                     "request_interval_max": 3.0,
                     "max_retries": 3,
-                    "detail_enrich_limit": 20,
                     "profile_provider_id": "",
                     "recommend_provider_id": "",
                 }
@@ -184,4 +186,5 @@ def test_doubanmovie_init_empty_config():
                 assert plugin.client._interval_max == 3.0
                 assert plugin.client._max_retries == 3
                 assert plugin.recommender._recommend_count == 5
-                assert plugin.recommender._min_rating == 8.0
+                assert plugin.recommender._min_rating == 7.0
+                assert plugin.recommender._candidate_pool_size == 20

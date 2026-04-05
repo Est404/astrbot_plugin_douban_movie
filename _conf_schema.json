@@ -1,14 +1,8 @@
 {
-  "sync_timeout": {
-    "description": "片单同步超时时间（秒）",
-    "type": "int",
-    "hint": "首次全量同步大量影片时可能需要较长时间，建议不低于 30",
-    "default": 180
-  },
   "douban_cookie": {
-    "description": "豆瓣Cookie（可选）",
+    "description": "豆瓣Cookie",
     "type": "text",
-    "hint": "遇到403反爬时填写。浏览器登录豆瓣→F12→Network→复制Cookie值。留空则不携带Cookie",
+    "hint": "浏览器登录豆瓣→F12→Network→复制Cookie值。用于访问豆瓣API，失效后需手动更新",
     "default": ""
   },
   "recommend_count": {
@@ -17,11 +11,17 @@
     "hint": "范围 1~10",
     "default": 5
   },
+  "candidate_pool_size": {
+    "description": "推荐候选池大小",
+    "type": "int",
+    "hint": "搜索结果中取前N部作为候选池，从中随机抽取推荐",
+    "default": 20
+  },
   "min_rating": {
     "description": "推荐影片的最低豆瓣评分",
     "type": "float",
     "hint": "低于此评分的影片不会被推荐",
-    "default": 8.0
+    "default": 7.0
   },
   "request_interval_min": {
     "description": "请求间隔下限（秒）",
@@ -40,12 +40,6 @@
     "type": "int",
     "hint": "遇到 403/429 等反爬响应时的重试次数",
     "default": 3
-  },
-  "detail_enrich_limit": {
-    "description": "单次同步后补充影片详情的最大数量",
-    "type": "int",
-    "hint": "同步后会为缺少类型/地区信息的影片抓取详情，此值控制每次补充的上限",
-    "default": 50
   },
   "profile_provider_id": {
     "description": "生成用户画像使用的LLM模型",

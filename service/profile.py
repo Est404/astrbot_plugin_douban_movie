@@ -1,144 +1,112 @@
 from __future__ import annotations
 
+from typing import Optional
+
 from astrbot.api import logger
 
 from ..db.database import Database
+from ..service.douban_client import DoubanClient
 
 
 class ProfileGenerator:
-    """基于已同步片单生成用户观影画像。"""
+    """基于豆瓣 collection_stats API 生成用户观影画像。"""
 
-    def __init__(self, db: Database):
+    def __init__(self, db: Database, client: DoubanClient):
         self.db = db
+        self.client = client
 
-    def _collect_stats(self, movies: list[dict]) -> dict:
-        """从观影列表中聚合统计数据，返回结构化的统计摘要。"""
-        total = len(movies)
+    def _extract_prefs_from_stats(self, stats: dict) -> dict:
+        """从 collection_stats API 响应中提取偏好数据。"""
+        # 类型偏好 — 从 recent_subjects 的 genres 统计
+        genre_counts: dict[str, int] = {}
+        region_counts: dict[str, int] = {}
+        decade_counts: dict[str, int] = {}
 
-        # 类型偏好
-        genre_stats: dict[str, dict] = {}
-        for m in movies:
-            if not m.get("genres"):
-                continue
-            for genre in m["genres"].split(","):
-                genre = genre.strip()
-                if not genre:
-                    continue
-                if genre not in genre_stats:
-                    genre_stats[genre] = {"count": 0, "ratings": []}
-                genre_stats[genre]["count"] += 1
-                if m.get("user_rating"):
-                    genre_stats[genre]["ratings"].append(m["user_rating"])
+        for subj in stats.get("recent_subjects", []):
+            # genres
+            for g in subj.get("genres", []):
+                name = g.get("name", "") if isinstance(g, dict) else str(g)
+                if name:
+                    genre_counts[name] = genre_counts.get(name, 0) + 1
 
-        top_genres = sorted(
-            genre_stats.items(), key=lambda x: x[1]["count"], reverse=True
-        )[:5]
+            # 从 card_subtitle 提取地区和年代
+            card = subj.get("card_subtitle", "")
+            parts = [p.strip() for p in card.split(" / ")]
 
-        # 地区偏好
-        region_stats: dict[str, int] = {}
-        for m in movies:
-            if not m.get("regions"):
-                continue
-            for region in m["regions"].split(","):
-                region = region.strip()
+            year = subj.get("year")
+            if year:
+                decade = f"{(int(year) // 10) * 10}s"
+                decade_counts[decade] = decade_counts.get(decade, 0) + 1
+
+            # 地区（card_subtitle 中通常是 第二部分）
+            if len(parts) >= 2:
+                region = parts[1].strip()
                 if region:
-                    region_stats[region] = region_stats.get(region, 0) + 1
+                    region_counts[region] = region_counts.get(region, 0) + 1
 
-        top_regions = sorted(region_stats.items(), key=lambda x: x[1], reverse=True)[:3]
+        # 排序取 Top
+        top_genres = sorted(genre_counts.items(), key=lambda x: x[1], reverse=True)[:5]
+        top_regions = sorted(region_counts.items(), key=lambda x: x[1], reverse=True)[:3]
+        top_decades = sorted(decade_counts.items(), key=lambda x: x[1], reverse=True)
 
-        # 年代偏好
-        decade_stats: dict[str, int] = {}
-        for m in movies:
-            if not m.get("year"):
-                continue
-            decade = f"{(m['year'] // 10) * 10}s"
-            decade_stats[decade] = decade_stats.get(decade, 0) + 1
-
-        top_decades = sorted(decade_stats.items(), key=lambda x: x[1], reverse=True)
-
-        # 评分习惯
-        ratings = [m["user_rating"] for m in movies if m.get("user_rating")]
-        avg_rating = sum(ratings) / len(ratings) if ratings else 0
+        # 总标记数
+        total_marked = 0
+        for year_data in stats.get("years", []):
+            total_marked += year_data.get("value", 0)
 
         return {
-            "total": total,
-            "top_genres": top_genres,
-            "top_regions": top_regions,
-            "top_decades": top_decades,
-            "avg_rating": avg_rating,
-            "rating_count": len(ratings),
+            "total_marked": total_marked,
+            "genre_prefs": top_genres,
+            "region_prefs": top_regions,
+            "decade_prefs": top_decades,
         }
 
-    def _format_stats_text(self, stats: dict) -> str:
-        """将统计摘要格式化为纯文本画像。"""
-        total = stats["total"]
-        top_genres = stats["top_genres"]
-        top_regions = stats["top_regions"]
-        top_decades = stats["top_decades"]
-        avg_rating = stats["avg_rating"]
-
-        if avg_rating >= 4.0:
-            rating_type = "宽容型"
-        elif avg_rating <= 2.5:
-            rating_type = "严厉型"
-        else:
-            rating_type = "中立型"
+    def _format_profile_from_stats(
+        self,
+        prefs: dict,
+        nickname: str = "",
+    ) -> str:
+        """将统计数据格式化为纯文本画像（LLM 不可用时的回退）。"""
+        total = prefs["total_marked"]
+        name = nickname or "你"
 
         lines = [
-            "📊 观影画像",
-            "━━━━━━━━━━━━━━━━━━",
-            f"🎬 看过：{total} 部",
+            f"🎬 {name} 的观影画像",
+            "",
+            f"📊 观影量：{total} 部标记",
         ]
 
-        if top_genres:
-            lines.append("\n🏷️ 类型偏好 TOP 5：")
-            for i, (genre, gstats) in enumerate(top_genres, 1):
-                avg = (
-                    sum(gstats["ratings"]) / len(gstats["ratings"])
-                    if gstats["ratings"]
-                    else 0
-                )
-                lines.append(f"  {i}. {genre}（{gstats['count']}部，均分{avg:.1f}）")
+        genre_prefs = prefs.get("genre_prefs", [])
+        if genre_prefs:
+            genre_parts = [
+                f"{g} ({c})" for g, c in genre_prefs[:5]
+            ]
+            lines.append(f"🎭 类型偏好：{' | '.join(genre_parts)}")
 
-        if top_regions:
-            lines.append("\n🌍 地区偏好 TOP 3：")
-            for i, (region, count) in enumerate(top_regions, 1):
-                lines.append(f"  {i}. {region}（{count}部）")
+        region_prefs = prefs.get("region_prefs", [])
+        if region_prefs:
+            region_parts = [f"{r} ({c})" for r, c in region_prefs[:3]]
+            lines.append(f"🌍 地区偏好：{' | '.join(region_parts)}")
 
-        if top_decades:
-            lines.append("\n📅 年代偏好：")
-            for decade, count in top_decades:
-                lines.append(f"  {decade}: {count}部")
-
-        lines.append("\n⭐ 评分习惯：")
-        lines.append(f"  平均打分：{avg_rating:.1f} / 5.0（{rating_type}）")
+        decade_prefs = prefs.get("decade_prefs", [])
+        if decade_prefs:
+            decade_parts = [f"{d} ({c})" for d, c in decade_prefs]
+            lines.append(f"📅 年代偏好：{' | '.join(decade_parts)}")
 
         return "\n".join(lines)
 
-    def _build_llm_prompt(self, stats: dict) -> str:
-        """将统计摘要构造为 LLM prompt。"""
-        genre_lines = []
-        for genre, gstats in stats["top_genres"]:
-            avg = (
-                sum(gstats["ratings"]) / len(gstats["ratings"])
-                if gstats["ratings"]
-                else 0
-            )
-            genre_lines.append(f"- {genre}：{gstats['count']}部，均分{avg:.1f}")
+    def _build_llm_prompt(self, prefs: dict, nickname: str = "") -> str:
+        """构造 LLM prompt 用于画像生成。"""
+        name = nickname or "该用户"
 
-        region_lines = [
-            f"- {r}：{c}部" for r, c in stats["top_regions"]
-        ]
-
-        decade_lines = [
-            f"- {d}：{c}部" for d, c in stats["top_decades"]
-        ]
+        genre_lines = [f"- {g}：{c}部" for g, c in prefs.get("genre_prefs", [])]
+        region_lines = [f"- {r}：{c}部" for r, c in prefs.get("region_prefs", [])]
+        decade_lines = [f"- {d}：{c}部" for d, c in prefs.get("decade_prefs", [])]
 
         return (
-            "你是一位专业的影评分析师。请根据以下用户的豆瓣观影统计数据，"
+            f"请根据以下豆瓣用户「{name}」的观影统计数据，"
             "生成一段生动有趣的中文观影画像分析（200字以内）。\n\n"
-            f"用户共看过 {stats['total']} 部电影，"
-            f"有 {stats['rating_count']} 部打了分，平均打分 {stats['avg_rating']:.1f}/5.0。\n\n"
+            f"用户共标记 {prefs['total_marked']} 部影视。\n\n"
             "类型偏好：\n" + "\n".join(genre_lines) + "\n\n"
             "地区偏好：\n" + "\n".join(region_lines) + "\n\n"
             "年代偏好：\n" + "\n".join(decade_lines) + "\n\n"
@@ -148,39 +116,93 @@ class ProfileGenerator:
     async def generate(
         self,
         astrbot_uid: str,
+        persona_text: str = "",
         context=None,
         provider_id: str = "",
     ) -> str:
-        """生成用户观影画像。如果配置了 LLM provider 则使用 LLM 辅助。"""
-        movies = await self.db.get_movies_by_status(astrbot_uid, "collect")
-        if not movies:
-            return "暂无观影数据，请先使用 /movie sync 同步片单。"
+        """生成用户观影画像。
 
-        # 数据完整性校验
-        with_genres = sum(1 for m in movies if m.get("genres"))
-        genre_ratio = with_genres / len(movies) if movies else 0
-        if genre_ratio < 0.3:
-            return (
-                f"⚠️ 画像数据不充分：{len(movies)} 部影片中仅 {with_genres} 部有类型信息。\n"
-                "请再次执行 /movie sync 补充影片详情后重试。"
-            )
+        Args:
+            astrbot_uid: AstrBot 用户 ID
+            persona_text: 人格提示词（注入到 LLM system prompt）
+            context: AstrBot Context（用于调用 llm_generate）
+            provider_id: LLM provider ID
 
-        stats = self._collect_stats(movies)
+        Returns:
+            格式化的画像文本
+        """
+        # 检查缓存
+        cached = await self.db.get_profile(astrbot_uid)
+        if cached and cached.get("profile_text"):
+            # 检查是否新鲜（24h 内）
+            from datetime import datetime, timedelta, timezone
+            updated_str = cached.get("updated_at")
+            if updated_str:
+                try:
+                    updated = datetime.fromisoformat(updated_str)
+                    if datetime.now(timezone.utc) - updated.replace(tzinfo=timezone.utc) < timedelta(hours=24):
+                        logger.info(f"用户 {astrbot_uid} 使用缓存的画像数据")
+                        return cached["profile_text"]
+                except (ValueError, TypeError):
+                    pass
+
+        # 获取绑定信息
+        bind_info = await self.db.get_bind(astrbot_uid)
+        if not bind_info:
+            return "❌ 请先使用 /movie bind 绑定豆瓣账号。"
+
+        douban_uid = bind_info["douban_uid"]
+        nickname = bind_info.get("nickname") or ""
+
+        # 调用 API
+        stats = await self.client.fetch_collection_stats(douban_uid)
+        if not stats:
+            if self.client.cookie_expired:
+                return "❌ 豆瓣 Cookie 已失效，请联系管理员更新。"
+            return "❌ 获取观影数据失败，请稍后重试。"
+
+        # 提取偏好
+        prefs = self._extract_prefs_from_stats(stats)
+
+        # 保存偏好数据到 DB（不管 LLM 是否成功都保存）
+        genre_list = [g for g, _ in prefs["genre_prefs"]]
+        region_list = [r for r, _ in prefs["region_prefs"]]
+        decade_list = [d for d, _ in prefs["decade_prefs"]]
 
         # 尝试 LLM 辅助
+        profile_text = None
         if context and provider_id:
             try:
-                prompt = self._build_llm_prompt(stats)
+                prompt = self._build_llm_prompt(prefs, nickname)
+                system_prompt = persona_text if persona_text else None
+
                 llm_resp = await context.llm_generate(
                     chat_provider_id=provider_id,
                     prompt=prompt,
+                    system_prompt=system_prompt,
                 )
                 if llm_resp and llm_resp.completion_text:
-                    stats_text = self._format_stats_text(stats)
-                    return f"{llm_resp.completion_text}\n\n{stats_text}"
+                    # LLM 分析 + 统计数据
+                    formatted = self._format_profile_from_stats(prefs, nickname)
+                    profile_text = f"{llm_resp.completion_text}\n\n{formatted}"
             except Exception as exc:
                 logger.warning(f"LLM 画像生成失败，回退到纯文本: {exc}")
 
         # 纯文本回退
-        logger.info(f"用户 {astrbot_uid} 画像生成完成，共 {stats['total']} 部")
-        return self._format_stats_text(stats)
+        if not profile_text:
+            profile_text = self._format_profile_from_stats(prefs, nickname)
+
+        # 缓存
+        await self.db.save_profile(
+            astrbot_uid=astrbot_uid,
+            profile_text=profile_text,
+            raw_stats=stats,
+            genre_prefs=genre_list,
+            region_prefs=region_list,
+            decade_prefs=decade_list,
+            total_marked=prefs["total_marked"],
+        )
+        await self.db.update_last_profile(astrbot_uid)
+
+        logger.info(f"用户 {astrbot_uid} 画像生成完成")
+        return profile_text

@@ -47,10 +47,13 @@ _mock_star.Context = MagicMock
 _mock_star.Star = type("Star", (), {"__init__": lambda self, ctx: None})
 _mock_star.StarTools = MagicMock()
 
+_mock_util = MagicMock()
+
 sys.modules.setdefault("astrbot", MagicMock())
 sys.modules.setdefault("astrbot.api", _mock_api)
 sys.modules.setdefault("astrbot.api.event", _mock_event)
 sys.modules.setdefault("astrbot.api.star", _mock_star)
+sys.modules.setdefault("astrbot.api.util", _mock_util)
 
 # ---------------------------------------------------------------------------
 # Now import the plugin modules safely
@@ -69,14 +72,6 @@ from astrbot_plugin_douban_movie.service.recommender import Recommender
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
-def event_loop():
-    """Provide a fresh event loop for async tests."""
-    loop = asyncio.new_event_loop()
-    yield loop
-    loop.close()
-
-
-@pytest.fixture
 async def db():
     """Provide an in-memory Database with tables created."""
     database = Database(":memory:")
@@ -92,7 +87,6 @@ async def db():
 def mock_client():
     """Provide a DoubanClient with all network methods mocked."""
     client = DoubanClient(interval_min=0.0, interval_max=0.0, max_retries=1)
-    client._request = AsyncMock(return_value=None)
     client._delay = AsyncMock()
     return client
 
@@ -107,45 +101,45 @@ def plugin_dir():
 # Helpers
 # ---------------------------------------------------------------------------
 
-def make_top250_movie(
+def make_search_result(
     movie_id: str = "1000000",
     title: str = "Test Movie",
+    rating: float = 8.5,
     year: int = 2020,
-    avg_rating: float = 9.0,
-    genres: str = "剧情",
-    regions: str = "美国",
-    quote: str = "",
+    card_subtitle: str = "2020 / 美国 / 科幻",
 ) -> dict:
-    """Helper to build a Top250-style movie dict."""
+    """Helper to build a search-result-style movie dict."""
     return {
-        "douban_movie_id": movie_id,
+        "id": movie_id,
         "title": title,
+        "rating": rating,
         "year": year,
-        "avg_rating": avg_rating,
-        "genres": genres,
-        "regions": regions,
-        "quote": quote,
+        "card_subtitle": card_subtitle,
     }
 
 
-def make_collection_movie(
-    movie_id: str = "1000000",
-    title: str = "Test Movie",
-    status: str = "collect",
-    user_rating: float | None = 4.0,
-    genres: str = "",
-    regions: str = "",
-    year: int | None = 2020,
-    marked_at: str | None = "2024-06-01",
+def make_collection_stats(
+    nickname: str = "测试用户",
+    total_marked: int = 100,
+    genres: list[dict] | None = None,
+    recent_subjects: list[dict] | None = None,
 ) -> dict:
-    """Helper to build a user-collection-style movie dict."""
+    """Helper to build a collection_stats API response."""
+    if genres is None:
+        genres = [{"name": "剧情"}, {"name": "科幻"}]
+    if recent_subjects is None:
+        recent_subjects = [
+            {
+                "title": "测试电影",
+                "id": "12345",
+                "year": 2024,
+                "rating": {"value": 8.5},
+                "genres": genres,
+                "card_subtitle": "2024 / 美国 / 剧情 / 科幻",
+            }
+        ]
     return {
-        "douban_movie_id": movie_id,
-        "title": title,
-        "status": status,
-        "user_rating": user_rating,
-        "genres": genres,
-        "regions": regions,
-        "year": year,
-        "marked_at": marked_at,
+        "viewer": {"name": nickname},
+        "years": [{"name": "2024", "value": total_marked}],
+        "recent_subjects": recent_subjects,
     }

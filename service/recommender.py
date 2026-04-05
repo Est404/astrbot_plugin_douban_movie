@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+import random
+import re
+import uuid
+from typing import Optional
+
 from astrbot.api import logger
 
 from ..db.database import Database
@@ -7,74 +12,65 @@ from ..service.douban_client import DoubanClient
 
 
 class Recommender:
-    """基于用户画像从豆瓣 Top 250 筛选推荐。"""
+    """基于豆瓣搜索 + 候选池的电影推荐。"""
 
     def __init__(
         self,
         db: Database,
         client: DoubanClient,
         recommend_count: int = 5,
-        min_rating: float = 8.0,
+        candidate_pool_size: int = 20,
+        min_rating: float = 7.0,
     ):
         self.db = db
         self.client = client
         self._recommend_count = recommend_count
+        self._candidate_pool_size = candidate_pool_size
         self._min_rating = min_rating
-        self._top250_cache: list[dict] | None = None
 
-    async def _ensure_top250(self) -> list[dict]:
-        if self._top250_cache is None:
-            self._top250_cache = await self.client.fetch_top250()
-        return self._top250_cache
+    def _build_search_keyword(
+        self,
+        user_input: str,
+        genre_prefs: list[str],
+        region_prefs: list[str],
+    ) -> str:
+        """合成搜索关键词：用户输入 + 画像偏好。"""
+        parts = []
 
-    @staticmethod
-    def _diversify(candidates: list[dict], count: int) -> list[dict]:
-        """从候选列表中选出得分最高且类型不重复的推荐。"""
-        if len(candidates) <= count:
-            return candidates
+        if user_input.strip():
+            parts.append(user_input.strip())
 
-        selected: list[dict] = []
-        seen_genres: set[str] = set()
+        # 取用户最偏好的类型作为补充（最多 2 个）
+        for genre in genre_prefs[:2]:
+            if genre not in user_input:
+                parts.append(genre)
 
-        # 第一轮：优先选不同类型的
-        for c in candidates:
-            if len(selected) >= count:
-                break
-            movie_genres = {g.strip() for g in c.get("genres", "").split(",") if g.strip()}
-            if not movie_genres or not (movie_genres & seen_genres):
-                selected.append(c)
-                seen_genres.update(movie_genres)
+        return " ".join(parts) if parts else "电影"
 
-        # 第二轮：如果还不够，按分数补齐
-        if len(selected) < count:
-            selected_ids = {c["douban_movie_id"] for c in selected}
-            for c in candidates:
-                if len(selected) >= count:
-                    break
-                if c["douban_movie_id"] not in selected_ids:
-                    selected.append(c)
-
-        return selected
-
-    def _build_llm_prompt(self, user_prefs: dict, results: list[dict]) -> str:
+    def _build_llm_reasons_prompt(
+        self,
+        results: list[dict],
+        genre_prefs: list[str],
+        region_prefs: list[str],
+    ) -> str:
         """构造 LLM prompt 用于生成推荐理由。"""
-        genre_lines = [f"- {g}：{c}部" for g, c in user_prefs["top_genres"]]
-        region_lines = [f"- {r}" for r in user_prefs["top_regions"]]
-
         movie_lines = []
         for i, r in enumerate(results, 1):
+            rating_str = f"豆瓣{r.get('rating')}分" if r.get("rating") else ""
+            year_str = f"({r.get('year')})" if r.get("year") else ""
+            subtitle = r.get("card_subtitle", "")
             movie_lines.append(
-                f"{i}. 《{r['title']}》({r.get('year', '?')}) "
-                f"豆瓣{r.get('avg_rating', '?')}分 "
-                f"类型：{r.get('genres', '未知')} "
-                f"地区：{r.get('regions', '未知')}"
+                f"{i}. 《{r['title']}》{year_str} {rating_str} {subtitle}"
             )
+
+        genre_str = "、".join(genre_prefs[:5]) if genre_prefs else "未知"
+        region_str = "、".join(region_prefs[:3]) if region_prefs else "未知"
 
         return (
             "你是一位专业影评人。请根据用户的观影偏好，为以下推荐影片各写一句简短的推荐理由"
             "（每句不超过30字，说明为什么适合该用户）。\n\n"
-            "用户偏好类型：\n" + "\n".join(genre_lines) + "\n\n"
-            "用户偏好地区：" + "、".join(region_lines) + "\n\n"
+            f"用户偏好类型：{genre_str}\n"
+            f"用户偏好地区：{region_str}\n\n"
             "推荐影片：\n" + "\n".join(movie_lines) + "\n\n"
             "请按编号逐条输出推荐理由，格式为：\n"
             "1. 推荐理由\n2. 推荐理由\n..."
@@ -82,131 +78,223 @@ class Recommender:
 
     def _parse_llm_reasons(self, text: str, count: int) -> list[str]:
         """从 LLM 返回文本中按编号解析推荐理由。"""
-        import re
-
         reasons = []
         for i in range(1, count + 1):
-            # 匹配 "1. xxx" 或 "1、xxx" 等格式
             pattern = rf"{i}[.、．]\s*(.+)"
             match = re.search(pattern, text)
             if match:
                 reasons.append(match.group(1).strip())
         return reasons
 
-    def _generate_template_reasons(self, results: list[dict]) -> None:
-        """用模板逻辑生成推荐理由（LLM 不可用时的回退）。"""
-        for r in results:
-            reasons: list[str] = []
-            if r.get("matched_genres"):
-                reasons.append(f"匹配你喜欢的{'/'.join(r['matched_genres'])}类型")
-            if r.get("avg_rating") and r["avg_rating"] >= 9.0:
-                reasons.append(f"豆瓣评分高达{r['avg_rating']}")
-            if r.get("quote"):
-                reasons.append(f"「{r['quote']}」")
-            r["reason"] = "，".join(reasons) if reasons else "高分佳作推荐"
-
-    async def recommend(
+    async def search_and_recommend(
         self,
         astrbot_uid: str,
-        genre_filter: str = "",
+        user_description: str = "",
+        persona_text: str = "",
         context=None,
         provider_id: str = "",
-    ) -> list[dict]:
-        bind = await self.db.get_bind(astrbot_uid)
-        if not bind:
-            return []
+    ) -> tuple[list[dict], str]:
+        """搜索并推荐电影。
 
-        watched_ids = await self.db.get_all_collected_movie_ids(astrbot_uid)
+        Returns:
+            (results, session_id) - 推荐结果列表和会话 ID
+        """
+        # 获取用户画像
+        profile = await self.db.get_profile(astrbot_uid)
+        if not profile:
+            return [], ""
 
-        movies = await self.db.get_movies_by_status(astrbot_uid, "collect")
-        genre_prefs: dict[str, int] = {}
-        user_regions: set[str] = set()
-        for m in movies:
-            if m.get("genres"):
-                for g in m["genres"].split(","):
-                    g = g.strip()
-                    if g:
-                        genre_prefs[g] = genre_prefs.get(g, 0) + 1
-            if m.get("regions"):
-                for r in m["regions"].split(","):
-                    r = r.strip()
-                    if r:
-                        user_regions.add(r)
+        genre_prefs = profile.get("genre_prefs") or []
+        region_prefs = profile.get("region_prefs") or []
 
-        top_genres = {
-            g
-            for g, _ in sorted(genre_prefs.items(), key=lambda x: x[1], reverse=True)[
-                :5
-            ]
-        }
+        # 合成搜索关键词
+        keyword = self._build_search_keyword(user_description, genre_prefs, region_prefs)
+        logger.info(f"用户 {astrbot_uid} 搜索关键词: {keyword}")
 
-        top250 = await self._ensure_top250()
+        # 搜索
+        search_results = await self.client.search_movies(keyword)
+        if not search_results:
+            return [], ""
 
-        candidates: list[dict] = []
-        for movie in top250:
-            if movie["douban_movie_id"] in watched_ids:
+        # 获取用户已看过的电影 ID
+        seen_ids = await self.db.get_seen_movie_ids(astrbot_uid)
+
+        # 过滤 + 排序
+        candidates = []
+        for movie in search_results:
+            mid = movie.get("id", "")
+            if not mid:
                 continue
-
-            if not movie.get("avg_rating") or movie["avg_rating"] < self._min_rating:
+            if mid in seen_ids:
                 continue
-
-            movie_genres: set[str] = set()
-            if movie.get("genres"):
-                movie_genres = {g.strip() for g in movie["genres"].split(",")}
-
-            if genre_filter and genre_filter not in movie_genres:
+            rating = movie.get("rating")
+            if rating is not None and rating < self._min_rating:
                 continue
+            candidates.append(movie)
 
-            matched = top_genres & movie_genres
-            score = len(matched) * 10 + (movie.get("avg_rating") or 0)
+        # 按评分排序（高分在前）
+        candidates.sort(
+            key=lambda x: x.get("rating") or 0, reverse=True
+        )
 
-            movie_regions_str = movie.get("regions", "")
-            if movie_regions_str:
-                for ur in user_regions:
-                    if ur in movie_regions_str:
-                        score += 5
-                        break
+        # 取候选池
+        pool = candidates[: self._candidate_pool_size]
+        if not pool:
+            return [], ""
 
-            candidates.append({**movie, "score": score, "matched_genres": matched})
+        # 随机抽取推荐数量
+        count = min(self._recommend_count, len(pool))
+        selected = random.sample(pool, count)
 
-        candidates.sort(key=lambda x: x["score"], reverse=True)
-        # 多样性打散：避免连续推荐相同类型的影片
-        results = self._diversify(candidates, self._recommend_count)
+        # 创建会话
+        session_id = str(uuid.uuid4())
+        candidate_ids = [m["id"] for m in pool]
+        shown_ids = [m["id"] for m in selected]
 
+        await self.db.create_rec_session(
+            session_id, astrbot_uid, keyword, candidate_ids
+        )
+        await self.db.update_rec_session_shown(session_id, shown_ids)
+
+        # 生成推荐理由
+        await self._generate_reasons(
+            selected, genre_prefs, region_prefs,
+            persona_text, context, provider_id,
+        )
+
+        return selected, session_id
+
+    async def re_recommend(
+        self,
+        session_id: str,
+        astrbot_uid: str,
+        persona_text: str = "",
+        context=None,
+        provider_id: str = "",
+    ) -> Optional[tuple[list[dict], str]]:
+        """用户反馈"看过了"后重新推荐。
+
+        Returns:
+            (results, session_id) 或 None（候选池耗尽）
+        """
+        session = await self.db.get_rec_session(session_id)
+        if not session:
+            return None
+
+        shown_ids: list[str] = session.get("shown_ids") or []
+        candidate_ids: list[str] = session.get("candidate_ids") or []
+
+        # 将已展示的电影写入 user_seen_movies
+        # 需要从搜索结果中获取标题（这里简化，只记录 ID）
+        seen_movies = [{"douban_movie_id": sid, "title": ""} for sid in shown_ids]
+        await self.db.add_seen_movies(astrbot_uid, seen_movies)
+
+        # 从候选池中排除已展示的
+        remaining = [mid for mid in candidate_ids if mid not in set(shown_ids)]
+
+        if not remaining:
+            return None
+
+        # 随机抽取
+        count = min(self._recommend_count, len(remaining))
+        new_selected_ids = random.sample(remaining, count)
+
+        # 需要获取这些电影的信息（尝试从搜索结果重新获取）
+        # 由于我们没有缓存搜索结果详情，这里用 ID 构造简化结果
+        results = []
+        for mid in new_selected_ids:
+            results.append({
+                "id": mid,
+                "title": f"电影 {mid}",
+                "rating": None,
+                "year": None,
+                "card_subtitle": "",
+            })
+
+        # 尝试获取详情补充信息
+        for r in results:
+            try:
+                detail = await self.client.fetch_movie_detail(r["id"])
+                if detail:
+                    r["title"] = detail.get("title", r["title"])
+                    r["rating"] = detail.get("rating")
+                    r["year"] = detail.get("year")
+                    r["card_subtitle"] = detail.get("card_subtitle", "")
+            except Exception:
+                pass
+
+        # 更新会话
+        new_shown_ids = shown_ids + new_selected_ids
+        await self.db.update_rec_session_shown(session_id, new_shown_ids)
+
+        # 获取用户偏好
+        profile = await self.db.get_profile(astrbot_uid)
+        genre_prefs = profile.get("genre_prefs") or [] if profile else []
+        region_prefs = profile.get("region_prefs") or [] if profile else []
+
+        # 生成推荐理由
+        await self._generate_reasons(
+            results, genre_prefs, region_prefs,
+            persona_text, context, provider_id,
+        )
+
+        return results, session_id
+
+    async def _generate_reasons(
+        self,
+        results: list[dict],
+        genre_prefs: list[str],
+        region_prefs: list[str],
+        persona_text: str,
+        context=None,
+        provider_id: str = "",
+    ):
+        """为推荐结果生成理由（LLM 或模板回退）。"""
         if not results:
-            return results
+            return
 
-        # 尝试 LLM 生成推荐理由
+        # LLM 生成推荐理由
         if context and provider_id:
             try:
-                user_prefs = {
-                    "top_genres": sorted(
-                        genre_prefs.items(), key=lambda x: x[1], reverse=True
-                    )[:5],
-                    "top_regions": list(user_regions),
-                }
-                prompt = self._build_llm_prompt(user_prefs, results)
+                prompt = self._build_llm_reasons_prompt(
+                    results, genre_prefs, region_prefs
+                )
+                system_prompt = persona_text if persona_text else None
+
                 llm_resp = await context.llm_generate(
                     chat_provider_id=provider_id,
                     prompt=prompt,
+                    system_prompt=system_prompt,
                 )
                 if llm_resp and llm_resp.completion_text:
-                    llm_reasons = self._parse_llm_reasons(
+                    reasons = self._parse_llm_reasons(
                         llm_resp.completion_text, len(results)
                     )
-                    if len(llm_reasons) == len(results):
-                        for r, reason in zip(results, llm_reasons):
+                    if len(reasons) == len(results):
+                        for r, reason in zip(results, reasons):
                             r["reason"] = reason
-                        logger.info(f"用户 {astrbot_uid} 推荐理由由 LLM 生成")
-                        return results
+                        return
             except Exception as exc:
-                logger.warning(f"LLM 推荐理由生成失败，回退到模板: {exc}")
+                logger.warning(f"LLM 推荐理由生成失败: {exc}")
 
-        # 回退：模板理由
-        self._generate_template_reasons(results)
+        # 模板回退
+        for r in results:
+            r["reason"] = self._template_reason(r, genre_prefs)
 
-        logger.info(
-            f"为用户 {astrbot_uid} 推荐 {len(results)} 部影片"
-            + (f"（筛选：{genre_filter}）" if genre_filter else "")
-        )
-        return results
+    @staticmethod
+    def _template_reason(movie: dict, genre_prefs: list[str]) -> str:
+        """模板推荐理由。"""
+        parts = []
+        rating = movie.get("rating")
+        if rating and rating >= 9.0:
+            parts.append(f"豆瓣评分高达 {rating}")
+        elif rating and rating >= 8.0:
+            parts.append(f"豆瓣评分 {rating}，口碑佳作")
+
+        subtitle = movie.get("card_subtitle", "")
+        for genre in genre_prefs[:3]:
+            if genre in subtitle:
+                parts.append(f"匹配你喜欢的{genre}类型")
+                break
+
+        return "，".join(parts) if parts else "高分佳作推荐"

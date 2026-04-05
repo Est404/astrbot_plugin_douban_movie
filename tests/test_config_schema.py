@@ -1,5 +1,5 @@
 """
-Test 2: Configuration Schema Validation
+Test: Configuration Schema Validation
 
 Verifies that _conf_schema.json:
 - Is valid JSON
@@ -25,14 +25,13 @@ def schema(plugin_dir):
 
 
 EXPECTED_FIELDS = {
-    "sync_timeout",
     "douban_cookie",
     "recommend_count",
+    "candidate_pool_size",
     "min_rating",
     "request_interval_min",
     "request_interval_max",
     "max_retries",
-    "detail_enrich_limit",
     "profile_provider_id",
     "recommend_provider_id",
 }
@@ -40,7 +39,7 @@ EXPECTED_FIELDS = {
 # Mapping from schema type string to Python type for default validation
 TYPE_MAP = {
     "int": int,
-    "float": (int, float),  # accept int where float is expected (e.g., default: 60 is valid for float)
+    "float": (int, float),  # accept int where float is expected
     "string": str,
     "text": str,
     "bool": bool,
@@ -88,7 +87,6 @@ class TestConfSchemaFieldConstraints:
         """Fields should have 'default', unless they are provider selectors."""
         for key, field in schema.items():
             if field.get("_special") == "select_provider":
-                # Provider select fields may omit default (empty string means no provider)
                 continue
             assert "default" in field, f"Field '{key}' missing 'default'"
 
@@ -101,7 +99,7 @@ class TestConfSchemaFieldConstraints:
             )
 
     def test_default_types_match_declared_types(self, schema):
-        """Default value type must match the declared 'type' field (for fields that have defaults)."""
+        """Default value type must match the declared 'type' field."""
         for key, field in schema.items():
             if "default" not in field:
                 continue
@@ -117,13 +115,11 @@ class TestConfSchemaFieldConstraints:
         """If 'hint' is present, it must be a non-empty string."""
         for key, field in schema.items():
             if "hint" in field:
-                assert isinstance(field["hint"], str), (
-                    f"Field '{key}' hint is not a string"
-                )
+                assert isinstance(field["hint"], str)
                 assert len(field["hint"]) > 0, f"Field '{key}' has empty hint"
 
     def test_no_extra_keys_per_field(self, schema):
-        """Each field should only have known keys: type, description, hint, default, _special."""
+        """Each field should only have known keys."""
         allowed_keys = {"type", "description", "hint", "default", "_special"}
         for key, field in schema.items():
             extra = set(field.keys()) - allowed_keys
@@ -133,23 +129,24 @@ class TestConfSchemaFieldConstraints:
 class TestConfSchemaSemanticConstraints:
     """Validate semantic correctness of default values."""
 
-    def test_sync_timeout_positive(self, schema):
-        assert schema["sync_timeout"]["default"] > 0
-
     def test_recommend_count_in_range(self, schema):
         val = schema["recommend_count"]["default"]
-        assert 1 <= val <= 50, f"recommend_count default {val} out of reasonable range"
+        assert 1 <= val <= 50
+
+    def test_candidate_pool_size_positive(self, schema):
+        assert schema["candidate_pool_size"]["default"] > 0
 
     def test_min_rating_in_range(self, schema):
         val = schema["min_rating"]["default"]
-        assert 0.0 <= val <= 10.0, f"min_rating default {val} out of 0-10 range"
+        assert 0.0 <= val <= 10.0
+
+    def test_min_rating_default_is_7(self, schema):
+        assert schema["min_rating"]["default"] == 7.0
 
     def test_request_interval_min_less_than_max(self, schema):
         min_val = schema["request_interval_min"]["default"]
         max_val = schema["request_interval_max"]["default"]
-        assert min_val <= max_val, (
-            f"request_interval_min ({min_val}) > request_interval_max ({max_val})"
-        )
+        assert min_val <= max_val
 
     def test_request_intervals_non_negative(self, schema):
         assert schema["request_interval_min"]["default"] >= 0
@@ -158,16 +155,12 @@ class TestConfSchemaSemanticConstraints:
     def test_max_retries_positive(self, schema):
         assert schema["max_retries"]["default"] > 0
 
-    def test_detail_enrich_limit_positive(self, schema):
-        assert schema["detail_enrich_limit"]["default"] > 0
-
-    def test_detail_enrich_limit_default_is_50(self, schema):
-        """detail_enrich_limit default is 50 (raised from 20 for better first-sync coverage)."""
-        assert schema["detail_enrich_limit"]["default"] == 50
+    def test_douban_cookie_default_empty(self, schema):
+        assert schema["douban_cookie"]["default"] == ""
 
 
 class TestConfSchemaProviderFields:
-    """Validate the new LLM provider configuration fields."""
+    """Validate the LLM provider configuration fields."""
 
     def test_profile_provider_id_exists(self, schema):
         assert "profile_provider_id" in schema
@@ -177,15 +170,11 @@ class TestConfSchemaProviderFields:
 
     def test_provider_fields_are_string_type(self, schema):
         for key in ("profile_provider_id", "recommend_provider_id"):
-            assert schema[key]["type"] == "string", (
-                f"Field '{key}' should be type 'string', got '{schema[key]['type']}'"
-            )
+            assert schema[key]["type"] == "string"
 
     def test_provider_fields_have_special_marker(self, schema):
         for key in ("profile_provider_id", "recommend_provider_id"):
-            assert schema[key].get("_special") == "select_provider", (
-                f"Field '{key}' should have _special='select_provider'"
-            )
+            assert schema[key].get("_special") == "select_provider"
 
     def test_provider_fields_have_description(self, schema):
         for key in ("profile_provider_id", "recommend_provider_id"):

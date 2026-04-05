@@ -1,42 +1,25 @@
 """
-Test 3D: Database CRUD Operations
+Test: Database CRUD Operations
 
 Uses in-memory SQLite (:memory:) to test:
 - init() table creation
-- bind_user() / get_bind() / unbind_user()
-- upsert_movie() / get_movies_by_status()
-- get_all_collected_movie_ids()
-- get_movie_count()
-- update_movie_details()
-- get_movies_without_details()
-- update_last_sync()
-- Edge cases: concurrent users, missing data, type handling
+- bind_user() / get_bind() / unbind_user() (with nickname)
+- save_profile() / get_profile()
+- add_seen_movies() / get_seen_movie_ids()
+- create_rec_session() / get_rec_session() / update_rec_session_shown()
+- update_last_profile()
+- Cascading delete on unbind
 """
 
 from __future__ import annotations
 
+import json
 import sqlite3
 
 import aiosqlite
 import pytest
 
 from astrbot_plugin_douban_movie.db.database import Database
-
-
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
-
-@pytest.fixture
-async def db():
-    """Provide a fresh in-memory database with tables created."""
-    database = Database(":memory:")
-    # Bypass init()'s mkdir for in-memory DB
-    database._conn = await aiosqlite.connect(":memory:")
-    database._conn.row_factory = sqlite3.Row
-    await database._create_tables()
-    yield database
-    await database.close()
 
 
 # ===========================================================================
@@ -46,29 +29,45 @@ async def db():
 class TestDatabaseInit:
 
     async def test_tables_created(self, db):
-        """init creates user_bind and movie_collection tables."""
+        """init creates all four tables."""
         cursor = await db._conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
         )
         tables = {r["name"] for r in await cursor.fetchall()}
         assert "user_bind" in tables
-        assert "movie_collection" in tables
+        assert "user_profile" in tables
+        assert "user_seen_movies" in tables
+        assert "rec_session" in tables
 
     async def test_user_bind_schema(self, db):
-        """user_bind table has expected columns (no cookie after refactor)."""
+        """user_bind table has expected columns."""
         cursor = await db._conn.execute("PRAGMA table_info(user_bind)")
         cols = {r["name"] for r in await cursor.fetchall()}
-        expected = {"astrbot_uid", "douban_uid", "bind_time", "last_sync"}
+        expected = {"astrbot_uid", "douban_uid", "nickname", "bind_time", "last_profile"}
         assert expected == cols
 
-    async def test_movie_collection_schema(self, db):
-        """movie_collection table has expected columns."""
-        cursor = await db._conn.execute("PRAGMA table_info(movie_collection)")
+    async def test_user_profile_schema(self, db):
+        """user_profile table has expected columns."""
+        cursor = await db._conn.execute("PRAGMA table_info(user_profile)")
         cols = {r["name"] for r in await cursor.fetchall()}
         expected = {
-            "douban_movie_id", "astrbot_uid", "title", "user_rating",
-            "genres", "regions", "year", "status", "marked_at", "fetched_at",
+            "astrbot_uid", "profile_text", "raw_stats", "genre_prefs",
+            "region_prefs", "decade_prefs", "total_marked", "updated_at",
         }
+        assert expected == cols
+
+    async def test_user_seen_movies_schema(self, db):
+        """user_seen_movies table has expected columns."""
+        cursor = await db._conn.execute("PRAGMA table_info(user_seen_movies)")
+        cols = {r["name"] for r in await cursor.fetchall()}
+        expected = {"id", "astrbot_uid", "douban_movie_id", "title", "created_at"}
+        assert expected == cols
+
+    async def test_rec_session_schema(self, db):
+        """rec_session table has expected columns."""
+        cursor = await db._conn.execute("PRAGMA table_info(rec_session)")
+        cols = {r["name"] for r in await cursor.fetchall()}
+        expected = {"session_id", "astrbot_uid", "keyword", "candidate_ids", "shown_ids", "created_at"}
         assert expected == cols
 
 
@@ -79,11 +78,17 @@ class TestDatabaseInit:
 class TestUserBind:
 
     async def test_bind_and_get(self, db):
-        await db.bind_user("user1", "douban_abc")
+        await db.bind_user("user1", "159896279", "测试用户")
         result = await db.get_bind("user1")
         assert result is not None
         assert result["astrbot_uid"] == "user1"
-        assert result["douban_uid"] == "douban_abc"
+        assert result["douban_uid"] == "159896279"
+        assert result["nickname"] == "测试用户"
+
+    async def test_bind_without_nickname(self, db):
+        await db.bind_user("user1", "159896279")
+        result = await db.get_bind("user1")
+        assert result["nickname"] is None
 
     async def test_get_bind_not_found(self, db):
         result = await db.get_bind("nonexistent")
@@ -91,299 +96,188 @@ class TestUserBind:
 
     async def test_bind_replaces_existing(self, db):
         """Re-binding the same user replaces the old record."""
-        await db.bind_user("user1", "douban_old")
-        await db.bind_user("user1", "douban_new")
+        await db.bind_user("user1", "111", "旧昵称")
+        await db.bind_user("user1", "222", "新昵称")
         result = await db.get_bind("user1")
-        assert result["douban_uid"] == "douban_new"
-
-    async def test_unbind_user(self, db):
-        await db.bind_user("user1", "douban_abc")
-        await db.unbind_user("user1")
-        result = await db.get_bind("user1")
-        assert result is None
-
-    async def test_unbind_nonexistent_user_no_error(self, db):
-        """Unbinding a user that doesn't exist should not raise."""
-        await db.unbind_user("ghost")
+        assert result["douban_uid"] == "222"
+        assert result["nickname"] == "新昵称"
 
     async def test_multiple_users_isolated(self, db):
         """Multiple users' bindings are isolated."""
-        await db.bind_user("u1", "d1")
-        await db.bind_user("u2", "d2")
+        await db.bind_user("u1", "111", "用户1")
+        await db.bind_user("u2", "222", "用户2")
         r1 = await db.get_bind("u1")
         r2 = await db.get_bind("u2")
-        assert r1["douban_uid"] == "d1"
-        assert r2["douban_uid"] == "d2"
+        assert r1["douban_uid"] == "111"
+        assert r2["douban_uid"] == "222"
 
 
 # ===========================================================================
-# upsert_movie / get_movies_by_status
-# ===========================================================================
-
-class TestMovieCRUD:
-
-    async def test_upsert_and_get_by_status(self, db):
-        await db.upsert_movie("user1", {
-            "douban_movie_id": "100",
-            "title": "Movie A",
-            "status": "collect",
-            "user_rating": 4.0,
-        })
-        await db.upsert_movie("user1", {
-            "douban_movie_id": "200",
-            "title": "Movie B",
-            "status": "wish",
-        })
-        await db.commit_batch()
-
-        collected = await db.get_movies_by_status("user1", "collect")
-        assert len(collected) == 1
-        assert collected[0]["title"] == "Movie A"
-        assert collected[0]["user_rating"] == 4.0
-
-        wished = await db.get_movies_by_status("user1", "wish")
-        assert len(wished) == 1
-        assert wished[0]["title"] == "Movie B"
-
-    async def test_upsert_replaces_existing(self, db):
-        """INSERT OR REPLACE updates the record."""
-        await db.upsert_movie("user1", {
-            "douban_movie_id": "100",
-            "title": "Old Title",
-            "status": "collect",
-        })
-        await db.commit_batch()
-
-        await db.upsert_movie("user1", {
-            "douban_movie_id": "100",
-            "title": "New Title",
-            "status": "collect",
-            "user_rating": 5.0,
-        })
-        await db.commit_batch()
-
-        movies = await db.get_movies_by_status("user1", "collect")
-        assert len(movies) == 1
-        assert movies[0]["title"] == "New Title"
-        assert movies[0]["user_rating"] == 5.0
-
-    async def test_get_by_status_empty(self, db):
-        """Querying a status with no entries returns empty list."""
-        result = await db.get_movies_by_status("user1", "collect")
-        assert result == []
-
-    async def test_movies_isolated_per_user(self, db):
-        """Users can only see their own movies."""
-        await db.upsert_movie("u1", {"douban_movie_id": "100", "title": "A", "status": "collect"})
-        await db.upsert_movie("u2", {"douban_movie_id": "200", "title": "B", "status": "collect"})
-        await db.commit_batch()
-
-        u1_movies = await db.get_movies_by_status("u1", "collect")
-        u2_movies = await db.get_movies_by_status("u2", "collect")
-        assert len(u1_movies) == 1
-        assert u1_movies[0]["title"] == "A"
-        assert len(u2_movies) == 1
-        assert u2_movies[0]["title"] == "B"
-
-    async def test_same_movie_different_users(self, db):
-        """Same movie_id can exist for different users."""
-        await db.upsert_movie("u1", {"douban_movie_id": "100", "title": "Shared", "status": "collect"})
-        await db.upsert_movie("u2", {"douban_movie_id": "100", "title": "Shared", "status": "wish"})
-        await db.commit_batch()
-
-        u1 = await db.get_movies_by_status("u1", "collect")
-        u2 = await db.get_movies_by_status("u2", "wish")
-        assert len(u1) == 1
-        assert len(u2) == 1
-
-
-# ===========================================================================
-# get_all_collected_movie_ids
-# ===========================================================================
-
-class TestCollectedMovieIds:
-
-    async def test_returns_collect_and_wish(self, db):
-        """Only 'collect' and 'wish' statuses are returned."""
-        await db.upsert_movie("u1", {"douban_movie_id": "1", "title": "A", "status": "collect"})
-        await db.upsert_movie("u1", {"douban_movie_id": "2", "title": "B", "status": "wish"})
-        await db.upsert_movie("u1", {"douban_movie_id": "3", "title": "C", "status": "do"})
-        await db.commit_batch()
-
-        ids = await db.get_all_collected_movie_ids("u1")
-        assert ids == {"1", "2"}
-
-    async def test_empty_when_no_movies(self, db):
-        ids = await db.get_all_collected_movie_ids("user1")
-        assert ids == set()
-
-
-# ===========================================================================
-# get_movie_count
-# ===========================================================================
-
-class TestMovieCount:
-
-    async def test_count_by_status(self, db):
-        await db.upsert_movie("u1", {"douban_movie_id": "1", "title": "A", "status": "collect"})
-        await db.upsert_movie("u1", {"douban_movie_id": "2", "title": "B", "status": "collect"})
-        await db.upsert_movie("u1", {"douban_movie_id": "3", "title": "C", "status": "wish"})
-        await db.upsert_movie("u1", {"douban_movie_id": "4", "title": "D", "status": "do"})
-        await db.commit_batch()
-
-        counts = await db.get_movie_count("u1")
-        assert counts["collect"] == 2
-        assert counts["wish"] == 1
-        assert counts["do"] == 1
-
-    async def test_count_empty(self, db):
-        counts = await db.get_movie_count("user1")
-        assert counts == {}
-
-    async def test_count_isolated_per_user(self, db):
-        await db.upsert_movie("u1", {"douban_movie_id": "1", "title": "A", "status": "collect"})
-        await db.upsert_movie("u2", {"douban_movie_id": "2", "title": "B", "status": "collect"})
-        await db.upsert_movie("u2", {"douban_movie_id": "3", "title": "C", "status": "collect"})
-        await db.commit_batch()
-
-        c1 = await db.get_movie_count("u1")
-        c2 = await db.get_movie_count("u2")
-        assert c1.get("collect", 0) == 1
-        assert c2.get("collect", 0) == 2
-
-
-# ===========================================================================
-# update_movie_details
-# ===========================================================================
-
-class TestUpdateMovieDetails:
-
-    async def test_update_genres_regions_year(self, db):
-        await db.upsert_movie("u1", {
-            "douban_movie_id": "100", "title": "Test", "status": "collect",
-        })
-        await db.commit_batch()
-
-        await db.update_movie_details("100", "u1", "剧情,科幻", "美国", 2020)
-        await db.commit_batch()
-
-        movies = await db.get_movies_by_status("u1", "collect")
-        assert len(movies) == 1
-        m = movies[0]
-        assert m["genres"] == "剧情,科幻"
-        assert m["regions"] == "美国"
-        assert m["year"] == 2020
-
-    async def test_update_overwrites_previous(self, db):
-        await db.upsert_movie("u1", {
-            "douban_movie_id": "100", "title": "Test", "status": "collect",
-            "genres": "旧类型",
-        })
-        await db.commit_batch()
-
-        await db.update_movie_details("100", "u1", "新类型", "新地区", 2023)
-        await db.commit_batch()
-
-        movies = await db.get_movies_by_status("u1", "collect")
-        assert movies[0]["genres"] == "新类型"
-        assert movies[0]["year"] == 2023
-
-    async def test_update_nonexistent_movie_no_error(self, db):
-        """Updating a movie that doesn't exist should not raise."""
-        await db.update_movie_details("999", "u1", "剧情", "美国", 2020)
-        await db.commit_batch()
-
-
-# ===========================================================================
-# get_movies_without_details
-# ===========================================================================
-
-class TestMoviesWithoutDetails:
-
-    async def test_finds_empty_genres(self, db):
-        await db.upsert_movie("u1", {"douban_movie_id": "1", "title": "A", "status": "collect", "genres": ""})
-        await db.upsert_movie("u1", {"douban_movie_id": "2", "title": "B", "status": "collect", "genres": "剧情"})
-        await db.commit_batch()
-
-        ids = await db.get_movies_without_details("u1", 10)
-        assert "1" in ids
-        assert "2" not in ids
-
-    async def test_respects_limit(self, db):
-        for i in range(10):
-            await db.upsert_movie("u1", {"douban_movie_id": str(i), "title": f"M{i}", "status": "collect", "genres": ""})
-        await db.commit_batch()
-
-        ids = await db.get_movies_without_details("u1", 3)
-        assert len(ids) <= 3
-
-    async def test_empty_when_all_have_details(self, db):
-        await db.upsert_movie("u1", {"douban_movie_id": "1", "title": "A", "status": "collect", "genres": "剧情"})
-        await db.commit_batch()
-
-        ids = await db.get_movies_without_details("u1", 10)
-        assert ids == []
-
-
-# ===========================================================================
-# update_last_sync
-# ===========================================================================
-
-class TestUpdateLastSync:
-
-    async def test_sets_last_sync(self, db):
-        await db.bind_user("u1", "d1")
-        await db.update_last_sync("u1")
-        bind = await db.get_bind("u1")
-        assert bind["last_sync"] is not None
-
-    async def test_last_sync_changes_on_update(self, db):
-        await db.bind_user("u1", "d1")
-        await db.update_last_sync("u1")
-        first = (await db.get_bind("u1"))["last_sync"]
-
-        # Small delay to ensure different timestamp
-        import asyncio
-        await asyncio.sleep(0.01)
-
-        await db.update_last_sync("u1")
-        second = (await db.get_bind("u1"))["last_sync"]
-        # Timestamps should be at least non-null (might be same due to precision)
-        assert second is not None
-
-
-# ===========================================================================
-# unbind_user also removes movies
+# unbind_user (cascading)
 # ===========================================================================
 
 class TestUnbindCascading:
 
-    async def test_unbind_removies_all_user_movies(self, db):
-        await db.bind_user("u1", "d1")
-        await db.upsert_movie("u1", {"douban_movie_id": "1", "title": "A", "status": "collect"})
-        await db.upsert_movie("u1", {"douban_movie_id": "2", "title": "B", "status": "wish"})
-        await db.commit_batch()
-
+    async def test_unbind_removes_bind(self, db):
+        await db.bind_user("u1", "111")
         await db.unbind_user("u1")
+        assert await db.get_bind("u1") is None
 
-        ids = await db.get_all_collected_movie_ids("u1")
-        assert ids == set()
+    async def test_unbind_removes_profile(self, db):
+        await db.bind_user("u1", "111")
+        await db.save_profile("u1", "画像文本", {"raw": True}, ["剧情"], ["美国"], ["2020s"], 100)
+        await db.unbind_user("u1")
+        assert await db.get_profile("u1") is None
 
-        movies = await db.get_movies_by_status("u1", "collect")
-        assert movies == []
+    async def test_unbind_removes_seen_movies(self, db):
+        await db.bind_user("u1", "111")
+        await db.add_seen_movies("u1", [{"douban_movie_id": "100", "title": "A"}])
+        await db.unbind_user("u1")
+        assert await db.get_seen_movie_ids("u1") == set()
+
+    async def test_unbind_removes_rec_sessions(self, db):
+        await db.bind_user("u1", "111")
+        await db.create_rec_session("sess1", "u1", "科幻", ["100", "200"])
+        await db.unbind_user("u1")
+        assert await db.get_rec_session("sess1") is None
 
     async def test_unbind_does_not_affect_other_users(self, db):
-        await db.bind_user("u1", "d1")
-        await db.bind_user("u2", "d2")
-        await db.upsert_movie("u1", {"douban_movie_id": "1", "title": "A", "status": "collect"})
-        await db.upsert_movie("u2", {"douban_movie_id": "2", "title": "B", "status": "collect"})
-        await db.commit_batch()
+        await db.bind_user("u1", "111")
+        await db.bind_user("u2", "222")
+        await db.add_seen_movies("u1", [{"douban_movie_id": "100", "title": "A"}])
+        await db.add_seen_movies("u2", [{"douban_movie_id": "200", "title": "B"}])
 
         await db.unbind_user("u1")
 
-        u2_movies = await db.get_movies_by_status("u2", "collect")
-        assert len(u2_movies) == 1
-        assert u2_movies[0]["title"] == "B"
+        assert await db.get_bind("u2") is not None
+        assert await db.get_seen_movie_ids("u2") == {"200"}
+
+    async def test_unbind_nonexistent_no_error(self, db):
+        await db.unbind_user("ghost")
+
+
+# ===========================================================================
+# save_profile / get_profile
+# ===========================================================================
+
+class TestProfileCRUD:
+
+    async def test_save_and_get_profile(self, db):
+        await db.save_profile(
+            "u1", "画像文本", {"key": "value"},
+            ["剧情", "科幻"], ["美国"], ["2020s"], 100,
+        )
+        profile = await db.get_profile("u1")
+        assert profile is not None
+        assert profile["profile_text"] == "画像文本"
+        assert profile["raw_stats"] == {"key": "value"}
+        assert profile["genre_prefs"] == ["剧情", "科幻"]
+        assert profile["region_prefs"] == ["美国"]
+        assert profile["decade_prefs"] == ["2020s"]
+        assert profile["total_marked"] == 100
+
+    async def test_save_profile_replaces_existing(self, db):
+        await db.save_profile("u1", "旧", {}, [], [], [], 0)
+        await db.save_profile("u1", "新", {}, ["剧情"], [], [], 50)
+        profile = await db.get_profile("u1")
+        assert profile["profile_text"] == "新"
+        assert profile["genre_prefs"] == ["剧情"]
+        assert profile["total_marked"] == 50
+
+    async def test_get_profile_not_found(self, db):
+        assert await db.get_profile("ghost") is None
+
+    async def test_json_fields_parsed(self, db):
+        """JSON fields are automatically parsed on get."""
+        await db.save_profile(
+            "u1", "text", {"a": 1}, ["剧情"], ["美国"], ["2020s"], 10,
+        )
+        profile = await db.get_profile("u1")
+        assert isinstance(profile["raw_stats"], dict)
+        assert isinstance(profile["genre_prefs"], list)
+
+
+# ===========================================================================
+# user_seen_movies
+# ===========================================================================
+
+class TestSeenMovies:
+
+    async def test_add_and_get_seen_ids(self, db):
+        await db.add_seen_movies("u1", [
+            {"douban_movie_id": "100", "title": "A"},
+            {"douban_movie_id": "200", "title": "B"},
+        ])
+        ids = await db.get_seen_movie_ids("u1")
+        assert ids == {"100", "200"}
+
+    async def test_add_duplicate_ignored(self, db):
+        """UNIQUE constraint: same uid + movie_id only stored once."""
+        await db.add_seen_movies("u1", [{"douban_movie_id": "100", "title": "A"}])
+        await db.add_seen_movies("u1", [{"douban_movie_id": "100", "title": "A2"}])
+        ids = await db.get_seen_movie_ids("u1")
+        assert len(ids) == 1
+
+    async def test_empty_when_no_movies(self, db):
+        ids = await db.get_seen_movie_ids("u1")
+        assert ids == set()
+
+    async def test_isolated_per_user(self, db):
+        await db.add_seen_movies("u1", [{"douban_movie_id": "100", "title": "A"}])
+        await db.add_seen_movies("u2", [{"douban_movie_id": "200", "title": "B"}])
+        assert await db.get_seen_movie_ids("u1") == {"100"}
+        assert await db.get_seen_movie_ids("u2") == {"200"}
+
+
+# ===========================================================================
+# rec_session
+# ===========================================================================
+
+class TestRecSession:
+
+    async def test_create_and_get_session(self, db):
+        await db.create_rec_session("sess1", "u1", "科幻", ["100", "200", "300"])
+        session = await db.get_rec_session("sess1")
+        assert session is not None
+        assert session["session_id"] == "sess1"
+        assert session["astrbot_uid"] == "u1"
+        assert session["keyword"] == "科幻"
+        assert session["candidate_ids"] == ["100", "200", "300"]
+        assert session["shown_ids"] == []
+
+    async def test_update_shown_ids(self, db):
+        await db.create_rec_session("sess1", "u1", "科幻", ["100", "200", "300"])
+        await db.update_rec_session_shown("sess1", ["100", "200"])
+        session = await db.get_rec_session("sess1")
+        assert session["shown_ids"] == ["100", "200"]
+
+    async def test_get_session_not_found(self, db):
+        assert await db.get_rec_session("ghost") is None
+
+    async def test_json_fields_parsed(self, db):
+        await db.create_rec_session("s1", "u1", "test", ["1", "2"])
+        session = await db.get_rec_session("s1")
+        assert isinstance(session["candidate_ids"], list)
+        assert isinstance(session["shown_ids"], list)
+
+
+# ===========================================================================
+# update_last_profile
+# ===========================================================================
+
+class TestUpdateLastProfile:
+
+    async def test_sets_last_profile(self, db):
+        await db.bind_user("u1", "111")
+        await db.update_last_profile("u1")
+        bind = await db.get_bind("u1")
+        assert bind["last_profile"] is not None
+
+    async def test_changes_on_update(self, db):
+        await db.bind_user("u1", "111")
+        await db.update_last_profile("u1")
+        first = (await db.get_bind("u1"))["last_profile"]
+        assert first is not None
 
 
 # ===========================================================================
@@ -392,35 +286,19 @@ class TestUnbindCascading:
 
 class TestDatabaseEdgeCases:
 
-    async def test_movie_with_none_fields(self, db):
-        """Movie with None user_rating, year, etc. should not crash."""
-        await db.upsert_movie("u1", {
-            "douban_movie_id": "1",
-            "title": "Nones",
-            "status": "collect",
-            "user_rating": None,
-            "year": None,
-            "marked_at": None,
-        })
-        await db.commit_batch()
+    async def test_unicode_data(self, db):
+        """Unicode strings are stored and retrieved correctly."""
+        await db.bind_user("u1", "111", "千と千尋の神隠し 🎬")
+        result = await db.get_bind("u1")
+        assert result["nickname"] == "千と千尋の神隠し 🎬"
 
-        movies = await db.get_movies_by_status("u1", "collect")
-        assert len(movies) == 1
-        assert movies[0]["user_rating"] is None
-
-    async def test_movie_with_unicode_title(self, db):
-        """Unicode titles are stored correctly."""
-        await db.upsert_movie("u1", {
-            "douban_movie_id": "1",
-            "title": "千と千尋の神隠し 🎬",
-            "status": "collect",
-        })
-        await db.commit_batch()
-
-        movies = await db.get_movies_by_status("u1", "collect")
-        assert movies[0]["title"] == "千と千尋の神隠し 🎬"
-
-    async def test_close_and_reuse(self, db):
-        """After close(), _conn is None."""
+    async def test_close_sets_conn_none(self, db):
         await db.close()
         assert db._conn is None
+
+    async def test_profile_with_empty_json_fields(self, db):
+        """Empty lists for JSON fields work correctly."""
+        await db.save_profile("u1", "text", {}, [], [], [], 0)
+        profile = await db.get_profile("u1")
+        assert profile["genre_prefs"] == []
+        assert profile["region_prefs"] == []
