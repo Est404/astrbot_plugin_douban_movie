@@ -5,6 +5,12 @@
     "hint": "首次全量同步大量影片时可能需要较长时间，建议不低于 30",
     "default": 180
   },
+  "douban_cookie": {
+    "description": "豆瓣Cookie（可选）",
+    "type": "text",
+    "hint": "遇到403反爬时填写。浏览器登录豆瓣→F12→Network→复制Cookie值。留空则不携带Cookie",
+    "default": ""
+  },
   "recommend_count": {
     "description": "每次推荐返回的影片数量",
     "type": "int",

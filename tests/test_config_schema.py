@@ -26,6 +26,7 @@ def schema(plugin_dir):
 
 EXPECTED_FIELDS = {
     "sync_timeout",
+    "douban_cookie",
     "recommend_count",
     "min_rating",
     "request_interval_min",
@@ -41,6 +42,7 @@ TYPE_MAP = {
     "int": int,
     "float": (int, float),  # accept int where float is expected (e.g., default: 60 is valid for float)
     "string": str,
+    "text": str,
     "bool": bool,
 }
 
@@ -92,7 +94,7 @@ class TestConfSchemaFieldConstraints:
 
     def test_type_values_are_valid(self, schema):
         """All declared types are in the allowed set."""
-        valid_types = {"int", "float", "string", "bool"}
+        valid_types = {"int", "float", "string", "text", "bool"}
         for key, field in schema.items():
             assert field["type"] in valid_types, (
                 f"Field '{key}' has invalid type '{field['type']}'"

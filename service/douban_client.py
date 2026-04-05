@@ -37,10 +37,12 @@ class DoubanClient:
         interval_min: float = 1.0,
         interval_max: float = 3.0,
         max_retries: int = 3,
+        cookie: str = "",
     ):
         self._interval_min = interval_min
         self._interval_max = interval_max
         self._max_retries = max_retries
+        self._cookie = cookie
 
     # ── 基础请求 ────────────────────────────────────────────
 
@@ -51,8 +53,12 @@ class DoubanClient:
 
         for attempt in range(retries):
             try:
+                headers = {**_BASE_HEADERS}
+                if self._cookie:
+                    headers["Cookie"] = self._cookie
+
                 async with httpx.AsyncClient(
-                    headers=_BASE_HEADERS, follow_redirects=True, timeout=15.0
+                    headers=headers, follow_redirects=True, timeout=15.0
                 ) as client:
                     resp = await client.get(url)
 

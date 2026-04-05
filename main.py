@@ -24,6 +24,7 @@ class DoubanMovie(Star):
             interval_min=config.get("request_interval_min", 1.0),
             interval_max=config.get("request_interval_max", 3.0),
             max_retries=config.get("max_retries", 3),
+            cookie=config.get("douban_cookie", ""),
         )
         self.profile_gen = ProfileGenerator(self.db)
         self.recommender = Recommender(
