@@ -1,15 +1,10 @@
 from __future__ import annotations
 
 import asyncio
-import sys
-from pathlib import Path
-
-# 将插件目录加入 sys.path，使 db / service 子包可被直接导入
-sys.path.insert(0, str(Path(__file__).parent))
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.star import Context, Star
+from astrbot.api.star import Context, Star, StarTools
 
 from db.database import Database
 from service.douban_client import DoubanClient
@@ -21,8 +16,7 @@ class DoubanMovie(Star):
     def __init__(self, context: Context):
         super().__init__(context)
 
-        data_dir = Path(__file__).parent / "data"
-        data_dir.mkdir(exist_ok=True)
+        data_dir = StarTools.get_data_dir()
 
         self.db = Database(str(data_dir / "douban_movie.db"))
         self.client = DoubanClient()
