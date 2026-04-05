@@ -100,6 +100,40 @@ class DoubanClient:
 
         return {"uid": douban_uid, "nickname": nickname}
 
+    # ── 片单计数（快速估算） ─────────────────────────────────
+
+    async def fetch_collection_counts(self, uid: str) -> dict[str, int]:
+        """抓取各状态第一页，从分页器读取总数。返回 {wish: N, do: N, collect: N}。"""
+        import re
+
+        counts: dict[str, int] = {}
+        for status in ("wish", "do", "collect"):
+            url = (
+                f"https://movie.douban.com/people/{uid}/{status}"
+                f"?start=0&sort=time&rating=all&filter=all&mode=grid"
+            )
+            html = await self._request(url)
+            if not html:
+                counts[status] = 0
+                continue
+
+            soup = BeautifulSoup(html, "html.parser")
+            thispage = soup.select_one(".thispage")
+            total_pages = 1
+            if thispage:
+                tp = thispage.get("data-total-page")
+                if tp:
+                    total_pages = int(tp)
+
+            items = soup.select(".article .grid-view .item") or soup.select(".item")
+            first_page_count = len(items)
+            if total_pages <= 1:
+                counts[status] = first_page_count
+            else:
+                counts[status] = (total_pages - 1) * 15 + first_page_count
+
+        return counts
+
     # ── 片单抓取 ────────────────────────────────────────────
 
     async def fetch_collection_page(
@@ -123,7 +157,7 @@ class DoubanClient:
             if movie:
                 movies.append(movie)
 
-        has_more = soup.select_one("a.next") is not None
+        has_more = soup.select_one(".next") is not None
         return movies, has_more
 
     @staticmethod

@@ -145,20 +145,55 @@ class DoubanMovie(Star):
                 )
                 return
 
-            yield event.plain_result("🔄 开始同步片单，请稍候...")
-
+            # ── 预估算 ──
+            yield event.plain_result("🔄 正在获取片单概览...")
             douban_uid = bind_info["douban_uid"]
             last_sync = bind_info.get("last_sync")
-            sync_timeout = float(self.config.get("sync_timeout", 60))
 
-            # 逐页抓取 + 即时写入，超时也能保留已获取的数据
+            try:
+                counts_estimate = await self.client.fetch_collection_counts(douban_uid)
+            except Exception:
+                counts_estimate = {}
+
+            total_est = sum(counts_estimate.values()) if counts_estimate else 0
+            avg_delay = (self.config.get("request_interval_min", 1.0) + self.config.get("request_interval_max", 3.0)) / 2
+            pages_est = sum((c + 14) // 15 for c in counts_estimate.values()) if counts_estimate else 0
+            time_est = pages_est * avg_delay
+            time_min = int(time_est // 60)
+            time_sec = int(time_est % 60)
+
+            est_parts = []
+            for key, label in [("wish", "想看"), ("do", "在看"), ("collect", "看过")]:
+                if counts_estimate.get(key):
+                    est_parts.append(f"{label} {counts_estimate[key]}")
+            est_str = " · ".join(est_parts) if est_parts else "未知"
+
+            yield event.plain_result(
+                f"📋 预计片单：{est_str}（共 {total_est} 部）\n"
+                f"⏱️ 预计耗时：约 {time_min}分{time_sec:02d}秒\n\n"
+                f"开始同步..."
+            )
+
+            # ── 逐页抓取 + 即时写入 + 断点续传 ──
+            sync_timeout = float(self.config.get("sync_timeout", 180))
+            progress = await self.db.get_sync_progress(uid)
+
             counts = {"wish": 0, "do": 0, "collect": 0}
             timed_out = False
 
             try:
                 async with asyncio.timeout(sync_timeout):
                     for status_type in ("wish", "do", "collect"):
-                        start = 0
+                        # 断点续传
+                        if status_type in progress:
+                            start = progress[status_type]["last_start"]
+                            counts[status_type] = progress[status_type]["fetched"]
+                            logger.info(
+                                f"用户 {uid} {status_type} 断点续传: start={start}"
+                            )
+                        else:
+                            start = 0
+
                         while True:
                             await self.client._delay()
                             movies, has_more = (
@@ -170,7 +205,7 @@ class DoubanMovie(Star):
                                 break
 
                             # 增量过滤：跳过上次同步之前标记的
-                            if last_sync:
+                            if last_sync and status_type not in progress:
                                 new_movies = []
                                 for m in movies:
                                     if m.get("marked_at") and m["marked_at"] > last_sync:
@@ -186,9 +221,14 @@ class DoubanMovie(Star):
                             await self.db.commit_batch()
                             counts[status_type] += len(movies)
 
+                            # 保存断点
+                            start += 15
+                            await self.db.save_sync_progress(
+                                uid, status_type, start, counts[status_type]
+                            )
+
                             if not has_more:
                                 break
-                            start += 15
             except asyncio.TimeoutError:
                 timed_out = True
                 logger.warning(f"用户 {uid} 同步超时，已保存部分数据")
@@ -200,6 +240,9 @@ class DoubanMovie(Star):
             if total_new > 0:
                 await self._enrich_movie_details(uid, enrich_limit)
 
+            # 同步完成：清除断点 & 更新时间
+            if not timed_out:
+                await self.db.clear_sync_progress(uid)
             await self.db.update_last_sync(uid)
 
             wish, do, collect = counts["wish"], counts["do"], counts["collect"]

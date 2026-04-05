@@ -3,7 +3,7 @@
     "description": "片单同步超时时间（秒）",
     "type": "int",
     "hint": "首次全量同步大量影片时可能需要较长时间，建议不低于 30",
-    "default": 60
+    "default": 180
   },
   "recommend_count": {
     "description": "每次推荐返回的影片数量",

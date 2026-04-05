@@ -40,6 +40,14 @@ class Database:
                 fetched_at       DATETIME DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY (douban_movie_id, astrbot_uid)
             );
+
+            CREATE TABLE IF NOT EXISTS sync_progress (
+                astrbot_uid  TEXT,
+                status_type  TEXT,
+                last_start  INTEGER DEFAULT 0,
+                fetched     INTEGER DEFAULT 0,
+                PRIMARY KEY (astrbot_uid, status_type)
+            );
             """
         )
         await self._conn.commit()
@@ -80,6 +88,34 @@ class Database:
             "UPDATE user_bind SET last_sync = CURRENT_TIMESTAMP "
             "WHERE astrbot_uid = ?",
             (astrbot_uid,),
+        )
+        await self._conn.commit()
+
+    # ── sync_progress ──────────────────────────────────────────
+
+    async def get_sync_progress(self, astrbot_uid: str) -> dict[str, dict]:
+        """返回 {status_type: {last_start, fetched}} 的进度映射。"""
+        cursor = await self._conn.execute(
+            "SELECT status_type, last_start, fetched FROM sync_progress "
+            "WHERE astrbot_uid = ?",
+            (astrbot_uid,),
+        )
+        rows = await cursor.fetchall()
+        return {r["status_type"]: {"last_start": r["last_start"], "fetched": r["fetched"]} for r in rows}
+
+    async def save_sync_progress(
+        self, astrbot_uid: str, status_type: str, last_start: int, fetched: int
+    ):
+        await self._conn.execute(
+            "INSERT OR REPLACE INTO sync_progress (astrbot_uid, status_type, last_start, fetched) "
+            "VALUES (?, ?, ?, ?)",
+            (astrbot_uid, status_type, last_start, fetched),
+        )
+        await self._conn.commit()
+
+    async def clear_sync_progress(self, astrbot_uid: str):
+        await self._conn.execute(
+            "DELETE FROM sync_progress WHERE astrbot_uid = ?", (astrbot_uid,)
         )
         await self._conn.commit()
 
