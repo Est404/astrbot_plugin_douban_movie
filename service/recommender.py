@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from astrbot.api import logger
 
-from db.database import Database
-from service.douban_client import DoubanClient
+from ..db.database import Database
+from ..service.douban_client import DoubanClient
 
 
 class Recommender:

@@ -6,10 +6,10 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools
 
-from db.database import Database
-from service.douban_client import DoubanClient
-from service.profile import ProfileGenerator
-from service.recommender import Recommender
+from .db.database import Database
+from .service.douban_client import DoubanClient
+from .service.profile import ProfileGenerator
+from .service.recommender import Recommender
 
 
 class DoubanMovie(Star):

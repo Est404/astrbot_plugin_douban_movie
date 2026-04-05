@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from astrbot.api import logger
 
-from db.database import Database
+from ..db.database import Database
 
 
 class ProfileGenerator:
